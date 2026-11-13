@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- No network access at all: connect-src 'none' means this page cannot send or fetch anything.
+     Only the one inline script below (by its SHA-256) and the inline style may run. -->
+<meta http-equiv="Content-Security-Policy" content="{{CSP}}">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{NAME}} builder</title>
+<style>{{STYLE}}</style>
+</head>
+<body>
+<main>
+<header>
+	<p class="eyebrow">For the Pioneer DJ XDJ-RX (first model), firmware 2.21</p>
+	<h1>{{NAME}} builder</h1>
+	<p class="lead">This page builds the mod's update files on your computer, from two files you download from
+	Pioneer yourself. It works offline. <strong>Your files never leave this computer</strong>: the page is not allowed
+	to connect anywhere (see "What this page does" at the bottom).</p>
+	<p class="note">Unofficial. Not affiliated with, endorsed by or supported by Pioneer DJ or AlphaTheta. Use at your
+	own risk.</p>
+</header>
+
+<section aria-labelledby="s1">
+	<h2 id="s1"><span class="num">1</span> Download two files from Pioneer</h2>
+	<div class="cards">
+		<div class="card">
+			<h3>Firmware 2.21</h3>
+			<p>On AlphaTheta's support page, click the download link.</p>
+			<p class="file">XDJ-RX_v221.zip · 48 MB</p>
+			<a class="link" href="{{FW_URL}}" target="_blank" rel="noopener noreferrer">Open the firmware page ↗</a>
+		</div>
+		<div class="card">
+			<h3>GPL source package, part .00</h3>
+			<p>On Pioneer's open-source page, click <em>Accept</em>, scroll to <strong>XDJ-RX → Version 1.50</strong> and
+			download <strong>only</strong> <code>pioneer_xdj_rx.tar.gz.00</code>. It's near the end of that list, after
+			the six <code>L3.0.35_…_source</code> files, which also end in <code>.00</code> to <code>.05</code> but aren't
+			the right ones.</p>
+			<p class="file">209,700 KB · arrives as <code>E58B0262-….zip</code></p>
+			<a class="link" href="{{GPL_URL}}" target="_blank" rel="noopener noreferrer">Open the GPL page ↗</a>
+		</div>
+	</div>
+	<p class="hint">Downloads with other names, or already unzipped (Safari does that), are fine. The page recognises
+	the files by their content.</p>
+</section>
+
+<section aria-labelledby="s2">
+	<h2 id="s2"><span class="num">2</span> Add both files here</h2>
+	<label class="drop" id="drop">
+		<input type="file" id="pick" multiple>
+		<span class="drop-main">Drop the two files here, or click to choose them</span>
+		<span class="drop-sub">They are read here, in this browser tab, and nowhere else.</span>
+	</label>
+	<ul class="status" aria-live="polite">
+		<li id="st-fw" class="wait"><span class="dot" aria-hidden="true"></span><span class="what">Firmware 2.21</span><span class="msg">waiting</span></li>
+		<li id="st-gpl" class="wait"><span class="dot" aria-hidden="true"></span><span class="what">GPL package part .00 (for the key)</span><span class="msg">waiting</span></li>
+	</ul>
+	<p id="other" class="error" hidden></p>
+</section>
+
+<section aria-labelledby="s3">
+	<h2 id="s3"><span class="num">3</span> Build</h2>
+	<button id="build" class="primary" disabled>Build the update files</button>
+	<ol id="steps" class="steps" aria-live="polite"></ol>
+	<p id="build-error" class="error" hidden></p>
+</section>
+
+<section id="results" aria-labelledby="s4" hidden>
+	<h2 id="s4"><span class="num">4</span> Your files</h2>
+	<p>Each file is called <code>XDJRX.UPD</code>, because that's the only name the XDJ-RX looks for. Put one at a time
+	on an empty USB stick, at the top level.</p>
+	<div class="card stick">
+		<h3>The stick: FAT32 <em>and</em> MBR</h3>
+		<p>The stick must be formatted <strong>FAT32 (MS-DOS FAT)</strong> with the partition scheme <strong>Master Boot
+		Record (MBR)</strong>. A FAT32 stick with a GPT partition table is not recognised by the update mode.</p>
+		<p class="hint"><strong>Mac:</strong> Disk Utility → View → Show All Devices → select the stick itself (the top
+		entry, not the volume below it) → Erase → Format "MS-DOS (FAT)", Scheme "Master Boot Record".<br>
+		<strong>Windows:</strong> most sticks already are MBR. To check: right-click Start → Disk Management →
+		right-click the stick's disk (on the left) → Properties → Volumes → "Partition style". If it says GPT: right-click
+		the stick's volume → Delete Volume (this erases the stick; make sure it's the stick), then right-click its disk →
+		Convert to MBR Disk, then right-click the empty space → New Simple Volume → FAT32. (Windows makes FAT32 volumes
+		only up to 32 GB; on a bigger stick, a 32 GB volume is fine.)</p>
+	</div>
+	<div class="cards">
+		<div class="card result" data-out="install">
+			<h3>Install {{NAME}}</h3>
+			<p>The mod. Installs over Pioneer's 2.21.</p>
+			<div class="actions"></div>
+			<p class="sum"></p>
+		</div>
+		<div class="card result" data-out="r1">
+			<h3>Restore R1</h3>
+			<p>Pioneer's original app back. The normal way to undo the mod. Keep it with your gear.</p>
+			<div class="actions"></div>
+			<p class="sum"></p>
+		</div>
+	</div>
+	<details class="card result emergency" data-out="r2">
+		<summary><h3>Emergency file R2 <span class="tag">read first</span></h3></summary>
+		<p>Pioneer's complete official firmware 2.21, unchanged except for its version number. Use it only if R1 doesn't
+		help. The XDJ-RX refuses to install the version it already has, so R2 calls itself a higher version, and
+		afterwards your XDJ-RX reports that number for good. A later R2 then needs a higher number again.</p>
+		<p class="r2row"><label for="r2rel">Version number</label>
+		<input id="r2rel" value="2.22" inputmode="decimal" size="5" maxlength="4" pattern="2\.\d\d">
+		<button id="r2go" class="small">Rebuild R2</button>
+		<span class="hint">2.22 for a unit that shows 2.21. One above what your XDJ-RX shows.</span></p>
+		<div class="actions"></div>
+		<p class="sum"></p>
+	</details>
+	<p><button id="zip" class="primary">Download everything as one zip (with instructions)</button></p>
+	<p class="hint">These files contain Pioneer's firmware, so please don't pass them on. Point people to this page
+	instead.</p>
+</section>
+
+<section aria-labelledby="s5">
+	<h2 id="s5">Install</h2>
+	<ol class="plain">
+		<li>Copy <code>XDJRX.UPD</code> from "Install" to the top level of an otherwise empty stick, formatted
+		<strong>FAT32 with MBR</strong> (see above; FAT32 on GPT doesn't work).</li>
+		<li>Switch the XDJ-RX off and plug the stick into the DECK 1 USB port.</li>
+		<li>Hold <strong>DECK 1 USB STOP</strong> and <strong>DECK 1 RELOOP/EXIT</strong> and switch it on. Keep holding until
+		the update screen appears.</li>
+		<li>Wait for "<em>{{NAME}} installed.</em>" Don't switch off while it's writing.</li>
+		<li>Switch off, remove the stick, switch on. The new settings are in UTILITY.</li>
+	</ol>
+	<p class="hint"><strong>Safe start:</strong> a start that hangs, or that is switched off within its first minute,
+	is followed by one start without the mod. So leave it on for a minute after switching on. The zip's
+	<code>README-FIRST.txt</code> has the details, the error screens and how to report a bug.</p>
+</section>
+
+<section aria-labelledby="s6">
+	<h2 id="s6">What this page does</h2>
+	<ul class="plain">
+		<li>It reads your two files in this browser tab. Nothing is uploaded: the page's security rule
+		(<code>connect-src 'none'</code>, in its source) forbids every network connection, and it works with Wi-Fi off.</li>
+		<li>It checks that they're exactly Pioneer's files, by checksum, and takes the update key from Pioneer's GPL
+		package. The key stays in this tab's memory and is never shown or saved.</li>
+		<li>It adds the mod (one library and one changed start line) to Pioneer's app archive. The result is checked
+		against the archive that was tested on real hardware, byte for byte, so it can't build anything else.</li>
+		<li>It builds the files the XDJ-RX's own update mode reads. Only the app area of the XDJ-RX is ever written:
+		never the boot loader, the system or the update mode itself.</li>
+	</ul>
+	<p class="hint">{{SOURCE}} Licence: GPL-3.0. Uses pako 2.1.0 (MIT). Pioneer DJ, XDJ-RX and rekordbox are
+	trademarks of their owners and are named here only to describe compatibility.</p>
+</section>
+<footer>{{NAME}} · builder {{BUILD_ID}}</footer>
+</main>
+<script>{{SCRIPT}}</script>
+</body>
+</html>

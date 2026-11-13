@@ -1,0 +1,27 @@
+XDJRX-MOD
+Copyright (C) 2026 JaNeinHub
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General
+Public License version 3 as published by the Free Software Foundation (see LICENSE). It is distributed in the
+hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.
+
+Not affiliated with, endorsed by or supported by Pioneer DJ Corporation or AlphaTheta Corporation. "Pioneer DJ",
+"XDJ-RX" and "rekordbox" are trademarks of their owners and are used here only to say which device this works with.
+
+What this repository does NOT contain
+-------------------------------------
+- No Pioneer firmware, no part of it, and no Pioneer program code.
+- No encryption keys.
+The builder page reads Pioneer's firmware and the update key from files the user downloads from Pioneer/AlphaTheta
+and processes them only on the user's own computer. Its output contains Pioneer's firmware and is for the user's
+own device only.
+
+The library (device/libxdjmod) checks a few short byte sequences of Pioneer's program before it changes anything
+in memory, so that it acts only on the exact program version it was made for.
+
+Third-party code
+----------------
+builder/vendor/pako-2.1.0/   pako 2.1.0, (C) 2014-2017 Vitaly Puzrin and Andrei Tuputcyn, MIT AND Zlib licence
+                             (builder/vendor/pako-2.1.0/LICENSE)
+The screens shown on the XDJ-RX during an update are drawn with the Aileron font (public domain) built into Pillow.

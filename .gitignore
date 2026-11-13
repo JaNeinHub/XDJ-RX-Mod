@@ -1,0 +1,12 @@
+# build output
+build/
+# never commit Pioneer's files or anything made from them
+*.UPD
+*.upd
+*.zip
+*.tar.gz
+*.tar.gz.*
+*.key
+# macOS / Windows
+.DS_Store
+Thumbs.db

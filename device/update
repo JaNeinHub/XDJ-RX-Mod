@@ -1,0 +1,125 @@
+#!/bin/sh
+#
+# XDJMOD app-only updater. Replaces Pioneer's `update` inside our XDJRX.UPD.
+# The initramfs (decrypt_update.sh) mounts the decrypted image, cd's into it and runs
+#   ./update USB <language code>
+# as root. This script writes ONLY /dev/mtd7 ("pioneer", the application archive) and
+# never touches U-Boot, its environment, the kernels, rootfs, data, gui or the panel MCU,
+# so the update path itself (kernel A + initramfs) always stays intact. See flash-plan.md.
+#
+# The same script serves the mod installer and the restore file (R1); images/target.conf says
+# which archive to write and which current contents are acceptable:
+#   TITLE   shown in the log
+#   SIZE    byte size of images/pioneer.tar.gz
+#   MD5     its md5
+#   ACCEPT  "any", or space-separated "size:md5" of archives that may be replaced
+#           (stock 2.21 and known mod builds). Anything else is refused, nothing written.
+#
+# Screens: the initramfs tool `image` can only show its own pictures D001/D003. We copy our
+# pictures over D001 in the RAM initramfs (D001 isn't used again after the update starts).
+# The script never returns: init would show "file is corrupt" on a non-zero exit, and on
+# zero it would carry on into a half-finished boot. It shows the result and waits for power-off.
+#
+# XDJMOD_SIM_ROOT is only set by the Mac simulator (sim.sh); on the RX it is empty.
+
+R="${XDJMOD_SIM_ROOT:-}"
+DEV="$R/dev/mtd7"
+PROC_MTD="$R/proc/mtd"
+IMGDIR="$R/root/gui/pioneer/imagedata/bin/D001"
+STICK="$R/mnt/usb"
+TMP="$R/tmp"
+LOG="$TMP/xdjmod-update.log"
+LANGC="${2:-0}"
+BOOT_LEN=0x300000		# what init copies from mtd7 at boot (nanddump --length)
+MTD7_LINE='mtd7: 00800000 00020000 "pioneer"'
+
+cd "$(dirname "$0")" || exit 1
+HERE=$(pwd)
+
+log() {
+	echo "xdjmod-update: $*"
+	echo "$*" >> "$LOG"
+}
+
+screen() {	# screen <name>: show screens/<name>.bin
+	cp "$HERE/screens/$1.bin" "$IMGDIR/English.bin" 2>/dev/null
+	cp "$HERE/screens/$1.bin" "$IMGDIR/Chinese.bin" 2>/dev/null
+	image -l "$LANGC" -n D001 -c > /dev/null 2>&1
+	log "screen $1"
+}
+
+finish() {	# finish <screen>: save the log to the stick, show the result, wait for power-off
+	log "result $1"
+	cat "$LOG" >> "$STICK/xdjmod-update.log" 2>/dev/null	# append: keeps earlier runs
+	sync
+	screen "$1"
+	while :; do sleep 3600; done
+}
+
+boot_md5() {	# boot_md5 <size>: md5 of the first <size> bytes of what boot would read from mtd7
+	head -c "$1" "$TMP/mtd7.bin" | md5sum | sed -e 's/ .*//'
+}
+
+read_mtd7() {
+	rm -f "$TMP/mtd7.bin"
+	nanddump -q --omitoob --bb=skipbad --length=$BOOT_LEN -f "$TMP/mtd7.bin" "$DEV" >> "$LOG" 2>&1
+}
+
+: > "$LOG"
+log "===== start $(date) args: $*"
+. "$HERE/images/target.conf"
+log "target: $TITLE size=$SIZE md5=$MD5"
+screen working
+
+# 1. the device is the one we expect: same partition table line as every RX tested so far
+if ! grep -q "$MTD7_LINE" "$PROC_MTD" || [ ! -c "$DEV" -a -z "$R" ]; then
+	log "unexpected partition table:"
+	cat "$PROC_MTD" >> "$LOG" 2>&1
+	finish fail_device
+fi
+
+# 2. our own archive arrived intact
+have=$(md5sum "$HERE/images/pioneer.tar.gz" | sed -e 's/ .*//')
+len=$(wc -c < "$HERE/images/pioneer.tar.gz" | tr -d ' ')
+if [ "$have" != "$MD5" ] || [ "$len" != "$SIZE" ]; then
+	log "archive check failed: md5=$have size=$len"
+	finish fail_file
+fi
+
+# 3. what is on mtd7 now
+if ! read_mtd7; then
+	log "nanddump failed"
+	finish fail_read
+fi
+if [ "$(boot_md5 "$SIZE")" = "$MD5" ]; then
+	log "already installed, nothing written"
+	finish already
+fi
+if [ "$ACCEPT" != any ]; then
+	known=
+	for a in $ACCEPT; do
+		if [ "$(boot_md5 "${a%%:*}")" = "${a#*:}" ]; then
+			known=$a
+		fi
+	done
+	if [ -z "$known" ]; then
+		log "mtd7 holds an unknown archive, nothing written"
+		finish fail_unknown
+	fi
+	log "mtd7 holds known archive $known"
+fi
+
+# 4. write and verify, like Pioneer's NandDownloader: erase, nandwrite -p, md5 read-back; 3 attempts
+screen writing
+n=1
+while [ $n -le 3 ]; do
+	log "writing flash ... attempt # $n"
+	flash_erase "$DEV" 0 0 >> "$LOG" 2>&1 &&
+		nandwrite -p "$DEV" "$HERE/images/pioneer.tar.gz" >> "$LOG" 2>&1 &&
+		read_mtd7 &&
+		[ "$(boot_md5 "$SIZE")" = "$MD5" ] &&
+		finish done
+	log "attempt $n failed"
+	n=$((n + 1))
+done
+finish fail_write

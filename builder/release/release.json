@@ -1,0 +1,89 @@
+{
+  "name": "XDJRX-MOD 1.0",
+  "title": "stock rbp 2.21 + libxdjmod (EVENT 3c)",
+  "libName": "libxdjmod.so, EVENT 3c",
+  "testedAs": "the EVENT 3c archive",
+  "date": {
+    "y": 2026,
+    "mo": 11,
+    "d": 13,
+    "h": 0,
+    "mi": 0,
+    "s": 0
+  },
+  "zipName": "XDJRX-MOD-1.0-files.zip",
+  "lib": {
+    "size": 80872,
+    "md5": "05d4eb4d18b900d3f5cd8a63ff9d5354"
+  },
+  "modTarMd5": "4199c0e380a49f7e890305f41754bf9b",
+  "modArchive": {
+    "size": 2171154,
+    "md5": "b02859581da55e7637dc9bedbc740986"
+  },
+  "aplOld": "\t\t/root/pioneer/rbp &\n",
+  "aplNew": "\t\t# XDJMOD: library (Utility entries, cue modes, meter, mono, health log in xdjmod-capture on a stick)\n\t\t# safe start: the previous start didn't run 60 s healthy (hung, or switched off early) -> no library this time\n\t\tif [ -e /root/rbp/xdjmod-starting ]; then\n\t\t\trm -f /root/rbp/xdjmod-starting\n\t\t\tsync\n\t\t\techo \"safe start: no library\" > /dev/shm/xdjmod-mode\n\t\t\t( /root/pioneer/rbp > /dev/shm/rbp_console.txt 2>&1; echo \"rbp ended: $? at $(cut -d' ' -f1 /proc/uptime)\" >> /dev/shm/rbp_exit.txt ) &\n\t\telse\n\t\t\techo 1 > /root/rbp/xdjmod-starting\n\t\t\tsync\n\t\t\techo \"library\" > /dev/shm/xdjmod-mode\n\t\t\t( LD_PRELOAD=/root/pioneer/libxdjmod.so XDJMOD_SWITCH=/root/rbp/xdjmod-hpmode XDJMOD_STARTING=/root/rbp/xdjmod-starting XDJMOD_OUT=scan:xdjmod-capture XDJMOD_STATE=/tmp/xdjmod-state /root/pioneer/rbp > /dev/shm/rbp_console.txt 2>&1; echo \"rbp ended: $? at $(cut -d' ' -f1 /proc/uptime)\" >> /dev/shm/rbp_exit.txt ) &\n\t\tfi\n",
+  "fwUrl": "https://support.alphatheta.com/en-US/articles/23880151048345?product=4416579218841",
+  "gplUrl": "https://www.pioneerdj.com/en/support/open-source-code-distribution/gnu-open-source-license/",
+  "sourceUrl": "https://github.com/JaNeinHub/XDJ-RX-Mod",
+  "screens": {
+    "install": {
+      "working": [
+        "XDJRX-MOD 1.0: install",
+        "Checking ... do not switch off."
+      ],
+      "writing": [
+        "XDJRX-MOD 1.0: install",
+        "Writing ... do not switch off."
+      ],
+      "done": [
+        "XDJRX-MOD 1.0 installed.",
+        "Turn the power off/on."
+      ],
+      "already": [
+        "XDJRX-MOD 1.0 was already installed.",
+        "Nothing written. Turn the power off/on."
+      ]
+    },
+    "restore": {
+      "working": [
+        "XDJRX-MOD: restoring Pioneer app",
+        "Checking ... do not switch off."
+      ],
+      "writing": [
+        "XDJRX-MOD: restoring Pioneer app",
+        "Writing ... do not switch off."
+      ],
+      "done": [
+        "Original Pioneer app restored.",
+        "Turn the power off/on."
+      ],
+      "already": [
+        "Original Pioneer app already there.",
+        "Nothing written. Turn the power off/on."
+      ]
+    },
+    "fail": {
+      "fail_device": [
+        "XDJRX-MOD: unexpected device (E1).",
+        "Nothing written. Turn the power off."
+      ],
+      "fail_file": [
+        "XDJRX-MOD: update file damaged (E2).",
+        "Nothing written. Turn the power off."
+      ],
+      "fail_read": [
+        "XDJRX-MOD: cannot read app area (E3).",
+        "Nothing written. Turn the power off."
+      ],
+      "fail_unknown": [
+        "XDJRX-MOD: unknown app version (E4).",
+        "Nothing written. Turn the power off."
+      ],
+      "fail_write": [
+        "XDJRX-MOD: write failed (E5).",
+        "Use the restore file next."
+      ]
+    }
+  }
+}
