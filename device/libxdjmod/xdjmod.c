@@ -41,15 +41,6 @@
 #include "xdjmod_core.h"
 
 #define EXPORT __attribute__((visibility("default")))
-/* XDJRX-MOD 1.0. The code still tests these switches in ordinary C conditions; the compiler removes the branches
- * that are off. */
-#define XDJMOD_EVENT 1		/* only features proven on hardware */
-#define XDJMOD_WAVE 1		/* colour waveforms (also wraps fopen/fopen64, to see which analysis files rbp reads) */
-#define XDJMOD_GIG 1		/* nothing measured, timed or logged per second; SCREEN SYNC fixed (SYNC_GIG) */
-#define XDJMOD_BJ 1			/* beat jump and JOG LIGHT */
-#define XDJMOD_FPS 1		/* DISPLAY REFRESH 20/30 and SCREEN SYNC */
-#define XDJMOD_EVENT3 1		/* no SHIFT + CUE shortcut (CUE MODE is in Utility), so no read() wrapper */
-#define XDJMOD_SHIFTCUE 0
 #define SYNC_GIG 4			/* index into sync_lead_us: 4.5 ms earlier */
 #define XDJMOD_VERSION "event-3c"
 #define RBP_PATH "/root/pioneer/rbp"
@@ -148,20 +139,8 @@ static volatile uint32_t master_periods;		/* master writes, for the safe-start h
 #define MONO_MAX_FRAMES 1024		/* rbp writes 64-frame periods */
 static int32_t mono_buf[MAX_PCM][2 * MONO_MAX_FRAMES];
 
-
-
-/* per-class rate caps (events per second) */
-struct cap { uint32_t sec, n; };
-#define CAP_SPI_TX 20
-#define CAP_SPI_RX 50
-#define CAP_I2C 100
-#define CAP_HID 50
-
-/* Raw frames (panel, i2c, hid) go into the log only with XDJMOD_FRAMES=1 (research builds). Since 0.9 the
- * everyday build only counts them. */
+/* Set from XDJMOD_FRAMES (raw device frames in the log); nothing in this build reads it. */
 static int log_frames;
-
-/* last panel frames, so only changes are logged */
 
 /* ---------- helpers ---------- */
 
@@ -173,8 +152,6 @@ static inline uint64_t now_us(void)
 }
 
 static inline int32_t gettid_(void) { return (int32_t)syscall(SYS_gettid); }
-
-
 
 static struct ev *ev_new(uint16_t type, uint64_t t)
 {
@@ -239,7 +216,7 @@ static int classify(const char *path)
 	if (!strncmp(path, "/dev/subucom_spi", 16)) return FD_SPI;
 	if (!strncmp(path, "/dev/i2c-", 9)) return FD_I2C;
 	if (!strncmp(path, "/dev/hidg", 9)) return FD_HID;
-	if (XDJMOD_FPS && !strncmp(path, "/dev/fb", 7)) return FD_FB;	/* 0.11: rbp's framebuffer ioctls are counted; WAVE 9 times them */
+	if (!strncmp(path, "/dev/fb", 7)) return FD_FB;
 	return FD_NONE;
 }
 
@@ -271,27 +248,22 @@ static inline int fd_cls(int fd)
 struct subucom_xfer { uint8_t multi_id, reserved, part_id, part_num; uint32_t bytes; uint64_t tx_buf; };
 #define IOC_TYPE(c) (((c) >> 8) & 0xff)
 #define IOC_NR(c) ((c) & 0xff)
-#define IOC_SIZE(c) (((c) >> 16) & 0x3fff)
 #define IOC_DIR(c) (((c) >> 30) & 3)	/* 1 = write (to the driver) */
 
-/* ---------- headphone cue mode switch (XDJMOD_SWITCH=<mode file>) ----------
- * SHIFT (deck 1) + CUE CH1 = normal cue, SHIFT + CUE CH2 = split cue, live. In split, the headphones
- * split only while a channel is cued (PX5): with no CUE lit the master plays in stereo. While SHIFT is held, the
- * active mode's CUE LED blinks 3 times per second. The mode is kept in the mode file and applied at start.
- * Pure logic and checks: xdjmod_core.h.
+/* ---------- headphone cue mode and settings (XDJMOD_SWITCH=<settings file>) ----------
+ * Utility CUE MODE: NORMAL, SPLIT (Pioneer's split cue, always on) or SPLIT STEREO (like a PX5: split only while a
+ * channel is cued; with no CUE lit the master plays in stereo). The mode is kept in the settings file with the
+ * other Utility settings and applied at start. Pure logic and checks: xdjmod_core.h.
  *
- * EVENT 3 (XDJMOD_SHIFTCUE = 0) has no SHIFT + CUE: no read() wrapper, no CUE LED blink; the mode comes from Utility
- * CUE MODE and the mode file only. Everything else in this section (mixer object, mode word, trim) is the same.
- *
- * Threads: rbp's panel thread runs hp_switch_rx() in read() and the LED override in ioctl(); the
- * low-priority xdjmod_ui thread finds the mixer, blinks, saves the mode. The audio thread is never touched:
- * the mode word is written through /proc/self/mem, which fails cleanly instead of faulting.
+ * Threads: the low-priority xdjmod_ui thread finds the mixer, writes the mode word and saves the settings. The
+ * audio thread is never touched: the mode word is written through /proc/self/mem, which fails cleanly instead of
+ * faulting.
  * While split is selected, the stereo path's fixed gain is lowered by hp_trim dB (the master in stereo on
  * both ears sounds louder than on one ear while cued); normal mode keeps Pioneer's exact value. */
 static char mode_path[128];
 static int sw_on;				/* switch configured and library active */
 static volatile int hp_mode = HP_SPLIT_STEREO;	/* wanted cue mode (HP_NORMAL/HP_SPLIT/HP_SPLIT_STEREO) */
-static volatile int split_pref = HP_SPLIT_STEREO;	/* the split SHIFT + CUE CH2 selects: the last one used */
+static volatile int split_pref = HP_SPLIT_STEREO;	/* the last split mode chosen (kept in the settings file) */
 static volatile uint32_t meter_pre = 1;		/* read by the meter sequence in rbp: 1 = before MASTER LEVEL */
 static int meter_ok, menu_ok;			/* code patches installed (constructor) */
 static volatile int master_mono, booth_mono;	/* MASTER MONO / BOOTH MONO, read by the audio thread */
@@ -299,11 +271,11 @@ static volatile int fps_sel;			/* DISPLAY REFRESH setting, index into gui_period
 static volatile uint32_t gui_period = 50;	/* read by the frame-rate sequence in rbp: ms per frame */
 static int gui_ok;				/* frame-rate sequence installed */
 static volatile int scroll_sel;			/* WAVEFORM SCROLL: 0 Pioneer's position, 1 SMOOTH (gui_task reads it) */
-static volatile int sync_sel;			/* SCREEN SYNC: index into sync_lead_us, 0 = Pioneer's refresh wait (wave build) */
+static volatile int sync_sel;			/* SCREEN SYNC: index into sync_lead_us, always SYNC_GIG */
 static int pos_ok;				/* position hooks installed */
 static volatile int mode_dirty;			/* to be saved by the UI thread */
-static volatile int measure_next;		/* NEXT START = MEASURE ONLY (one-shot, settings file) */
-static int measure_only;			/* this start: frame meter only (constructor) */
+static volatile int measure_next;		/* always 0 (a field of the settings file) */
+static int measure_only;			/* always 0 (see the constructor) */
 static volatile uintptr_t hp_obj;		/* the HeadPhone object, 0 = not (yet) found */
 static int mem_fd = -1, mem_writable;
 static pthread_mutex_t led_lock;		/* rbp's LED frames vs the UI thread's */
@@ -311,15 +283,12 @@ static uint8_t led_rbp[128];			/* rbp's latest LED frame (multi 0, part 0) */
 static struct subucom_xfer led_x;		/* its transfer header */
 static int led_fd = -1, led_have;
 static unsigned long led_req;
-static int led_active;				/* the override is on the panel */
-static uint8_t led_last;			/* byte 10 currently sent while active */
 static volatile uint8_t cue_leds = 0;		/* byte 10 of rbp's own LED frame: which CUE buttons are lit */
 static volatile int hp_trim = HP_TRIM_DEFAULT;	/* dB less on the master in stereo while split is selected */
 static int gain_off;				/* the stereo gain literal didn't look right: leave it alone */
 static volatile int out_found;			/* out_dir is complete (set by the log thread) */
-static volatile int wave_mode;			/* WAVEFORM COLOR: WAVE_BLUE / WAVE_RGB / WAVE_3BAND (wave build) */
+static volatile int wave_mode;			/* WAVEFORM COLOR: WAVE_BLUE / WAVE_RGB / WAVE_3BAND */
 #define WAVE_NAME(m) ((unsigned)(m) < 3 ? xdj_wave_name[m] : "?")
-
 
 static int mem_read(uintptr_t a, void *buf, size_t n)
 {
@@ -389,7 +358,6 @@ static void gain_apply(void)
 	if (changed)
 		note("switch: stereo gain %s", want == HP_STEREO_GAIN_BITS ? "original" : "lowered for split");
 }
-
 
 /* Search rbp's anonymous writable memory for the HeadPhone object. heap_only: just [heap] (40 MB),
  * else every anonymous writable mapping (about 830 MB virtual; untouched pages read as the
@@ -472,10 +440,10 @@ static void mode_load(void)
 	booth_mono = st.booth_mono;
 	fps_sel = st.fps;
 	gui_period = gui_period_ms[fps_sel];
-	measure_next = XDJMOD_EVENT ? 0 : st.measure_next;	/* the event build never starts "measure only" */
-	wave_mode = XDJMOD_WAVE ? st.wave : WAVE_BLUE;
+	measure_next = 0;
+	wave_mode = st.wave;
 	scroll_sel = st.scroll;
-	sync_sel = XDJMOD_GIG ? SYNC_GIG : XDJMOD_WAVE ? st.sync : 0;
+	sync_sel = SYNC_GIG;
 	bj_settings_parse(&bj_set, b, n > 0 ? (size_t)n : 0);
 	jog_mode = oa_settings_parse(b, n > 0 ? (size_t)n : 0);
 }
@@ -540,7 +508,6 @@ static void meter_install(void)
 /* gui_task marks itself (gui_frame): its refresh waits are the ones SCREEN SYNC replaces. */
 static __thread int t_gui __attribute__((tls_model("initial-exec")));
 
-
 /* ---- SCREEN SYNC (xdjmod_core.h: sync_next, vs_pll) ----
  * DirectFB copies each finished picture into the single-page screen right after gui_task's refresh wait; the copy
  * overtakes the readout at row ~93 (the tear). With SCREEN SYNC on, xdjmod_sync (core 0) waits for the refreshes and
@@ -555,7 +522,6 @@ static __thread int t_gui __attribute__((tls_model("initial-exec")));
  * free most of the time (rbp makes no other framebuffer calls while running). */
 enum { SYNC_OFF, SYNC_REQ, SYNC_ON };
 #define SYNC_WIN_US 3000
-#define SYNC_LATE_US 500		/* gui_task woke this much after the planned moment: counted */
 static const char *const sync_label[SYNC_MODES] = {
 	"pioneer", "at refresh", "1.5 ms earlier", "3.0 ms earlier", "4.5 ms earlier", "6.0 ms earlier",
 };
@@ -568,16 +534,9 @@ struct sync_pub {				/* the refresh model (anchor + k * period) and the thread's
 	uint32_t wakes, resets, res_sum, res_max, late;
 };
 static volatile uint32_t sync_pub_seq;
-static struct sync_pub sync_pub;		/* the thread publishes (seq), gui_task and the health thread read */
-static volatile int sync_pll_reset;		/* the health thread: start a new minute's maximum */
+static struct sync_pub sync_pub;		/* the thread publishes (seq), gui_task reads */
 static struct vs_pll sync_pll;			/* the thread only */
 static uint64_t sync_gui_real;			/* gui_task only: end of its last real wait (in SYNC_REQ) */
-struct sync_gstats {
-	uint32_t seq;				/* first: gui_task writes (seqlock), the health thread copies */
-	uint32_t own, timed, rough, late_n, sleep_sum, sleep_max, late_sum, late_max;
-};
-static struct sync_gstats sync_gs;
-static volatile int sync_gs_reset;		/* set by the health thread after a copy: gui_task zeroes sync_gs */
 
 static void sleep_until_us(uint64_t t)
 {
@@ -591,37 +550,13 @@ static void sleep_ms(unsigned ms)
 	nanosleep(&ts, NULL);
 }
 
-/* gui_task: own = 1 for a real wait, else one timed sleep (slept / late = after the planned moment, us). */
-static void sync_gs_add(int own, int rough, uint32_t slept, uint32_t late)
-{
-	uint32_t q = sync_gs.seq;
-	__atomic_store_n(&sync_gs.seq, q + 1, __ATOMIC_RELAXED);
-	__atomic_thread_fence(__ATOMIC_RELEASE);
-	if (__atomic_load_n(&sync_gs_reset, __ATOMIC_ACQUIRE)) {
-		memset((char *)&sync_gs + sizeof sync_gs.seq, 0, sizeof sync_gs - sizeof sync_gs.seq);
-		__atomic_store_n(&sync_gs_reset, 0, __ATOMIC_RELAXED);
-	}
-	if (own) {
-		sync_gs.own++;
-	} else {
-		sync_gs.timed++;
-		sync_gs.rough += rough != 0;
-		sync_gs.sleep_sum += slept;
-		if (slept > sync_gs.sleep_max) sync_gs.sleep_max = slept;
-		sync_gs.late_sum += late;
-		if (late > sync_gs.late_max) sync_gs.late_max = late;
-		sync_gs.late_n += late > SYNC_LATE_US;
-	}
-	__atomic_store_n(&sync_gs.seq, q + 2, __ATOMIC_RELEASE);
-}
-
 /* gui_task's FBIO_WAITFORVSYNC (inside DirectFB's flip), from the ioctl wrapper. */
 static int sync_gui_wait(int fd, unsigned long req, void *arg)
 {
 	struct sync_pub m;
-	uint64_t t, target, w;
+	uint64_t t, target;
 	uint32_t q;
-	int st = __atomic_load_n(&sync_state, __ATOMIC_ACQUIRE), rough = 0, e;
+	int st = __atomic_load_n(&sync_state, __ATOMIC_ACQUIRE), e;
 	if (st != SYNC_ON) {	/* the thread isn't waiting: Pioneer's wait */
 		int r = real_ioctl(fd, req, arg);
 		if (st == SYNC_REQ && r == 0) {
@@ -629,25 +564,17 @@ static int sync_gui_wait(int fd, unsigned long req, void *arg)
 			sync_gui_real = now_us();
 			__atomic_compare_exchange_n(&sync_state, &want, SYNC_ON, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 		}
-		if (!XDJMOD_GIG) sync_gs_add(1, 0, 0, 0);
 		return r;
 	}
 	t = now_us();
 	if (!seq_read(&sync_pub_seq, &m, &sync_pub, sizeof m, &q) || !m.period_q8) {
 		m.anchor = sync_gui_real;	/* the thread's first wake hasn't come yet */
 		m.period_q8 = SYNC_PERIOD_NOMINAL_Q8;
-		rough = 1;
-	} else if (!m.valid) {
-		rough = 1;	/* the thread is still learning: last wake + the nominal period */
 	}
 	target = sync_next(t, m.anchor, m.period_q8, -sync_lead(sync_sel));	/* within one refresh from now */
 	e = errno;
 	sleep_until_us(target);
 	errno = e;
-	if (!XDJMOD_GIG) {
-		w = now_us();
-		sync_gs_add(0, rough, (uint32_t)(w - t), w > target ? (uint32_t)(w - target) : 0);
-	}
 	return 0;
 }
 
@@ -671,8 +598,9 @@ static void sync_publish(const struct vs_pll *p, uint64_t t)
 	seq_publish(&sync_pub_seq, &sync_pub, &m, sizeof m);
 }
 
-/* xdjmod_sync: idle (normal priority, 100 ms sleeps) while SCREEN SYNC is PIONEER; real-time 30 on core 0 while on,
- * where it does a few us of work per refresh. Stops for good on driver errors or calls that don't wait. */
+/* xdjmod_sync: SCREEN SYNC is always on (sync_sel = SYNC_GIG, 4.5 ms early; no Utility entry). Real-time 30 on
+ * core 0, where it does a few us of work per refresh; it would idle (100 ms sleeps) only with the setting PIONEER.
+ * Stops for good on driver errors or calls that don't wait. */
 static void *sync_thread(void *unused)
 {
 	cpu_set_t cpus;
@@ -712,7 +640,7 @@ static void *sync_thread(void *unused)
 			sleep_ms(100);
 			continue;
 		}
-		if (st == SYNC_OFF) {	/* learn anew (the counters for the log keep running) */
+		if (st == SYNC_OFF) {	/* learn anew */
 			sync_pll.n = sync_pll.period_q8 = sync_pll.valid = 0;
 			sync_publish(&sync_pll, 0);	/* no stale model from an earlier time on */
 			want = SYNC_OFF;
@@ -733,7 +661,6 @@ static void *sync_thread(void *unused)
 			t = now_us();
 			sleep_until_us(sync_next(t + SYNC_WIN_US, a, pq, 0) - SYNC_WIN_US);
 		}
-		if (!XDJMOD_GIG && __atomic_exchange_n(&sync_pll_reset, 0, __ATOMIC_RELAXED)) sync_pll.res_max = 0;
 		t_in = now_us();
 		if (real_ioctl(fd, FBIO_WAITFORVSYNC_, &zero) != 0) {
 			err_last = errno;
@@ -764,7 +691,7 @@ static void *sync_thread(void *unused)
 }
 
 /* Called by gui_task (real-time, core 0) after every frame, from the sequence at GUI_CAVE: returns the sleep in ms
- * (0 = draw the next frame at once) and feeds the frame meter. One clock read, no locks, no logging. */
+ * (0 = draw the next frame at once). No locks, no logging. */
 static uint32_t gui_frame(uint32_t dt)
 {
 	static int prev_late;
@@ -776,10 +703,6 @@ static void gui_install(void)
 {
 	uint32_t cave[GUI_CAVE_WORDS], b;
 	unsigned i;
-	if (!XDJMOD_FPS) {
-		boot_note("display: Pioneer's drawing loop (event build)");
-		return;	/* gui_ok stays 0: no DISPLAY REFRESH / NEXT START entries, no frame meter, no vsync */
-	}
 	if (rd32(GUI_SITE) != gui_site_orig[0] || rd32(GUI_SITE + 4) != gui_site_orig[1]) {
 		boot_note("display: unexpected code at %x, not installed", GUI_SITE);
 		return;
@@ -800,8 +723,8 @@ static void gui_install(void)
 }
 
 /* ---- Waveform position at draw time (xdjmod_core.h: POS_*, COL_*) ----
- * pos_copy runs in Ui_CycleTask, pos_hook in gui_task. The tracks run in both settings, so the minute lines compare
- * Pioneer's steps with SMOOTH's either way; only SMOOTH writes the column. */
+ * pos_copy runs in Ui_CycleTask, pos_hook in gui_task. The tracks run in both settings; only SMOOTH writes the
+ * column. */
 static struct pos_ring pos_ring;
 static struct pos_trk pos_trk[2];		/* gui_task only, as are the next four */
 static struct pos_delay pos_delay;
@@ -816,7 +739,7 @@ static void *pos_copy(void *dst, const void *src, size_t n)
 	return dst;
 }
 
-/* The gig build: the same tracks, delay and column as the measuring builds below, without the statistics. */
+/* gui_task: take the new snapshot copies from the ring: the copy interval (for the delay), each deck's positions. */
 static void pos_take(void)
 {
 	struct pos_sample s;
@@ -841,7 +764,7 @@ static void pos_hook(uint32_t deck)
 	if (deck > 1) return;
 	t = now_us();
 	pos_take();
-	t -= pos_delay_step(&pos_delay);	/* the display time: now - delay (slewed every waveform, as below) */
+	t -= pos_delay_step(&pos_delay);	/* the display time: now - delay (slewed every waveform) */
 	if (!scroll_sel) return;
 	count = rd32(rd32(rd32(wv + 4)));
 	zoom = *(volatile const float *)(uintptr_t)(wv + 0x18);
@@ -855,7 +778,7 @@ static void pos_install(void)
 {
 	uint32_t cave[POS_CAVE_WORDS], b[3];
 	unsigned i;
-	if (!gui_ok) return;	/* only with the frame-rate switch: the event build keeps Pioneer's drawing */
+	if (!gui_ok) return;	/* needs the frame-rate sequence */
 	if (rd32(POS_SITE) != POS_SITE_ORIG || rd32(COL_SITE0) != COL_SITE0_ORIG || rd32(COL_SITE1) != COL_SITE1_ORIG) {
 		boot_note("scroll: unexpected code at %x/%x/%x, not installed", POS_SITE, COL_SITE0, COL_SITE1);
 		return;
@@ -878,7 +801,7 @@ static void pos_install(void)
 	boot_note("scroll: switchable, %s", scroll_sel ? "smooth" : "original");
 }
 
-/* ---- Colour waveforms (wave build; xdjmod_core.h: WAVE_*, OV_*) ----
+/* ---- Colour waveforms (xdjmod_core.h: WAVE_*, OV_*) ----
  * The sequence at WAVE_CAVE sends every column of the detail waveforms to wave_col (RGB) or wave_col3 (3-band)
  * while wave_fn holds its address, else straight on to Pioneer's routine (BLUE); the one at OV_CAVE does the same for
  * the overview strips with ov_fn and ov_draw / ov_draw3. The worker thread reads each ANLZ????.EXT that rbp opens (and
@@ -892,7 +815,7 @@ static struct wave_cache wave_cache;		/* worker only */
 static pthread_mutex_t wave_lock;		/* the path queue */
 #define WAVE_QUEUE 8
 static char wave_q[WAVE_QUEUE][192];
-static unsigned wave_qhead, wave_qtail, wave_qlost;
+static unsigned wave_qhead, wave_qtail, wave_qlost;	/* wave_qlost: counted, not reported */
 
 /* Called by gui_task for each column in RGB / 3-band mode, with rbp's arguments (zoom in s0). */
 static WAVE_PCS void wave_col(uint32_t deck, uint32_t col, uint32_t start, uint32_t end, float zoom)
@@ -995,7 +918,7 @@ static uint8_t *wave_beside(const char *path, const char *ext, size_t *len)
  * so a deck that holds a track no longer cached has its file read again (wave_again). Worker only. */
 #define WAVE_KNOWN 32
 static struct { char path[sizeof wave_q[0]]; uint32_t n; } wave_known[WAVE_KNOWN];
-static unsigned wave_nknown, wave_reread;
+static unsigned wave_nknown, wave_reread;	/* wave_reread: counted, not reported */
 static uint32_t wave_looked[2];	/* per deck: the buffer fingerprint last looked up */
 
 static void wave_remember(const char *path, uint32_t n)
@@ -1104,7 +1027,6 @@ static uint8_t bj_led_now(int d, uint64_t t)
 static uint8_t oa_sent;				/* the jog light state in the frames now (led_lock) */
 static uint32_t oa_ch[2];			/* UI thread: the channel objects of CH1 / CH2, as last found */
 static int oa_readable = -1;			/* UI thread: last result, for the notes */
-static unsigned oa_last = 4;			/* UI thread: decks on air, as last noted */
 static uint64_t oa_retry;			/* UI thread: when to look for the channels again */
 
 static int oa_find(void)
@@ -1152,14 +1074,6 @@ static uint8_t oa_led_now(uint64_t t)
 	if (!ok) return 0;
 	for (d = 0; d < 2; d++)
 		if (oa_on_air(&c[d])) on |= 1u << d;
-	if (!XDJMOD_GIG && on != oa_last) {	/* gig: no note per change */
-		for (d = 0; d < 2; d++)
-			if ((on ^ oa_last) >> d & 1 || oa_last > 3)
-				note("onair: deck %d %s (fader %.3f gain %.3g, crossfader gain %.3g assign %u)", d + 1,
-				     on >> d & 1 ? "on" : "off", (double)c[d].fader, (double)c[d].fader_gain,
-				     (double)c[d].xf_gain, c[d].assign);
-		oa_last = on;
-	}
 	return oa_led_state(JOG_ONAIR, 1, on);
 }
 
@@ -1181,12 +1095,9 @@ static void bj_jump(int d, int beats)
 	if (n >= 2) to = bj_target(bj_ms[d], n, pos, beats);
 	pthread_mutex_unlock(&bj_lock);
 	if (to < 0 || to > 0x7fffffff) {
-		if (!XDJMOD_GIG)
-			note("beatjump: deck %d %+d beats from %d: %s", d + 1, beats, pos, n < 2 ? "no grid" : "past the last beat");
 		return;
 	}
 	((void (*)(uint32_t, int))(uintptr_t)BJ_SET_POS)(pl, (int)to);
-	if (!XDJMOD_GIG) note("beatjump: deck %d %+d beats, %d -> %d", d + 1, beats, pos, (int)to);	/* gig: no note per jump */
 }
 
 /* rbp's AUTO BEAT LOOP key handler calls this first (through the sequence at BJ_CAVE). rbp's handler always runs. */
@@ -1334,136 +1245,9 @@ static void wave_again(void)
 	}
 }
 
-
-/* Diagnostics: with the capture folder, once
- * a deck's buffer has stayed the same for 2 s without a track on it, write the buffer and rbp's own copy of the PWV3
- * bytes it was filled from (0x129fa0: per-deck track data at 0x17f326c + deck*0x186c4, +0xc object whose +0x10 is
- * the bytes, +0x10 the entry count) into the folder, and compare the buffer with every cached track. At most 12. */
-#define WAVE_SRC0	0x17f326cu
-#define WAVE_SRC_STEP	0x186c4u
-static int wave_probe[2] = { -1, -1 };	/* a pipe: write() from an unmapped address fails with EFAULT, no crash */
-
-static int wave_peek(uint32_t a, uint32_t *v)
-{
-	if (wave_probe[0] < 0 || real_write(wave_probe[1], (const void *)(uintptr_t)a, 4) != 4) return 0;
-	return real_read(wave_probe[0], v, 4) == 4;
-}
-
-static void wave_dump(unsigned k, uint32_t deck, const char *what, uint32_t a, size_t n)
-{
-	char path[320];
-	ssize_t w = -1;
-	int fd;
-	snprintf(path, sizeof path, "%s/wave-%u-deck%u-%s.bin", out_dir, k, deck + 1, what);
-	fd = real_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (fd < 0) {
-		note("wave diag: cannot write %s", path);
-		return;
-	}
-	if (n) w = real_write(fd, (const void *)(uintptr_t)a, n);	/* EFAULT-safe too */
-	real_close(fd);
-	note("wave diag: wave-%u-deck%u-%s.bin %ld of %lu bytes from %08x", k, deck + 1, what, (long)w,
-	     (unsigned long)n, a);
-}
-
-static void wave_diag(unsigned k, uint32_t d, uint32_t count, uint32_t buf)
-{
-	uint32_t src = WAVE_SRC0 + d * WAVE_SRC_STEP, s8, sobj, sn, sdata = 0, i, j;
-	uint32_t obj = WAVE_OBJ0 + d * WAVE_OBJ_STEP;
-	int ok_buf = buf == WAVE_BUF0 + d * WAVE_BUF_STEP && count <= WAVE_MAX;
-	s8 = *(const uint32_t *)(uintptr_t)(src + 8);
-	sobj = *(const uint32_t *)(uintptr_t)(src + 0xc);
-	sn = *(const uint32_t *)(uintptr_t)(src + 0x10);
-	note("wave diag %u: deck %u count %u buf %08x flags %08x", k, d + 1, count, buf,
-	     *(const uint32_t *)(uintptr_t)(obj + WAVE_OFF_FLAGS));
-	if (sobj && !wave_peek(sobj + 0x10, &sdata)) sdata = 0;
-	note("wave diag %u: src +8 %08x +c %08x +10 %u, bytes at %08x", k, s8, sobj, sn, sdata);
-	if (count <= WAVE_MAX) wave_dump(k, d, "buf", buf, (size_t)count * 2);
-	if (sdata && sn <= WAVE_MAX) wave_dump(k, d, "src", sdata, sn);
-	if (!ok_buf) return;
-	for (j = 0; j < WAVE_SLOTS; j++) {
-		const struct wave_track *t = wave_cache.slot[j];
-		const uint8_t *b = (const uint8_t *)(uintptr_t)buf;
-		uint32_t m, bh = 0, bw = 0, first = 0xffffffffu;
-		if (!t) continue;
-		m = t->n < count ? t->n : count;
-		for (i = 0; i < m; i++) {
-			int h = b[2 * i] != pwv3_height(t->pwv3[i]), w = b[2 * i + 1] != t->pwv3[i] >> 5;
-			bh += h;
-			bw += w;
-			if ((h || w) && first == 0xffffffffu) first = i;
-		}
-		if (first == 0xffffffffu)
-			note("wave diag %u: slot %u (%u entries): first %u agree", k, j, t->n, m);
-		else
-			note("wave diag %u: slot %u (%u entries): of %u, height %u / white %u differ; first %u: %u/%u, file "
-			     "%02x", k, j, t->n, m, bh, bw, first, b[2 * first], b[2 * first + 1], t->pwv3[first]);
-	}
-}
-
-static void wave_diag_step(void)
-{
-	static uint32_t last[2][3], done[2][3], steady[2];
-	static unsigned dumps;
-	uint32_t d, i;
-	if (!__atomic_load_n(&out_found, __ATOMIC_ACQUIRE)) return;
-	if (wave_probe[0] < 0 && pipe(wave_probe) != 0) wave_probe[0] = wave_probe[1] = -1;
-	for (d = 0; d < 2; d++) {
-		uint32_t obj = WAVE_OBJ0 + d * WAVE_OBJ_STEP, cur[3];
-		int same = 1, seen = 1;
-		cur[0] = *(const uint32_t *)(uintptr_t)obj;
-		cur[1] = *(const uint32_t *)(uintptr_t)(obj + WAVE_OFF_BUF);
-		cur[2] = cur[0] && cur[0] <= WAVE_MAX && cur[1] == WAVE_BUF0 + d * WAVE_BUF_STEP ?
-			 wave_sig(cur[0], (const uint8_t *)(uintptr_t)cur[1]) : 0;
-		for (i = 0; i < 3; i++) {
-			same &= cur[i] == last[d][i];
-			seen &= cur[i] == done[d][i];
-			last[d][i] = cur[i];
-		}
-		steady[d] = same && !wave_env.pub[d] ? steady[d] + 1 : 0;
-		if (steady[d] < 40 || seen || !cur[0] || dumps >= 12) continue;	/* 2 s the same and not in colour */
-		for (i = 0; i < 3; i++) done[d][i] = cur[i];
-		wave_diag(++dumps, d, cur[0], cur[1]);
-	}
-}
-
-/* The overview per deck as the worker sees it, logged when it changes: 0 no track, 1 a track without overview data,
- * 2 in colour, 3 rbp's overview isn't the file's (for 2 s: right after a load the two may disagree for a moment).
- * With the capture folder, a 3 writes rbp's 900 bytes and the file's 800 into it (at most 6 pairs). */
-static void ov_watch(void)
-{
-	static int state[2];
-	static unsigned steady[2], dumps;
-	uint32_t d, k, i;
-	for (d = 0; d < 2; d++) {
-		const uint8_t *buf = (const uint8_t *)(uintptr_t)(OV_BUF + OV_DECK_BYTES * d);
-		const struct wave_track *t = wave_env.pub[d], *u;
-		int s = !t ? 0 : !t->ovp ? 1 : 3;
-		for (k = 0; k < 2 && s; k++) {
-			u = wave_env.pub[d ^ k];
-			if (u && u->ovp && !memcmp(buf, u->ovp, 2 * OV_N)) s = 2;
-		}
-		steady[d] = s == 3 ? steady[d] + 1 : 0;
-		if (s == state[d] || (s == 3 && steady[d] < 40)) continue;
-		state[d] = s;
-		if (s == 1) note("wave: deck %u overview: no data in the track's files", d + 1);
-		if (s == 2) note("wave: deck %u overview in colour", d + 1);
-		if (s != 3) continue;
-		for (i = 0; i < 2 * OV_N && buf[i] == t->ovp[i]; i++) {}
-		i &= ~1u;
-		note("wave: deck %u overview stays blue: rbp's differs from the file's at entry %u (%u/%u, file %u/%u)",
-		     d + 1, i / 2, buf[i], buf[i + 1], t->ovp[i], t->ovp[i + 1]);
-		if (!ov_ok || !__atomic_load_n(&out_found, __ATOMIC_ACQUIRE) || dumps >= 6) continue;
-		dumps++;
-		wave_dump(100 + dumps, d, "ov", OV_BUF + OV_DECK_BYTES * d, OV_DECK_BYTES);
-		wave_dump(100 + dumps, d, "ovfile", (uint32_t)(uintptr_t)t->ovp, 2 * OV_N);
-	}
-}
-
 static void *wave_thread(void *unused)
 {
 	cpu_set_t cpus;
-	unsigned tick = 0;
 	struct wave_track *was[2] = { NULL, NULL };
 	(void)unused;
 	prctl(PR_SET_NAME, "xdjmod_wave", 0, 0, 0);
@@ -1474,7 +1258,7 @@ static void *wave_thread(void *unused)
 	for (;;) {
 		struct timespec ts = { 0, 50 * 1000 * 1000 };
 		char path[sizeof wave_q[0]];
-		uint32_t d, k, cached = 0;
+		uint32_t d;
 		nanosleep(&ts, NULL);
 		for (;;) {
 			int have = 0;
@@ -1499,19 +1283,6 @@ static void *wave_thread(void *unused)
 		if (bj_ok)
 			for (d = 0; d < 2; d++) bj_grid_publish(d, wave_env.pub[d] ? wave_env.pub[d]->key : 0);
 		wave_again();
-		if (XDJMOD_GIG) continue;	/* no buffer dumps, overview checks or minute line */
-		wave_diag_step();
-		if (ov_ok) ov_watch();
-		if (++tick % 1200 == 0 && __atomic_load_n(&out_found, __ATOMIC_ACQUIRE)) {	/* every minute */
-			for (k = 0; k < WAVE_SLOTS; k++) cached += wave_cache.slot[k] != NULL;
-			note("wave: %s; ours/Pioneer's columns %u/%u, overviews %u/%u; cached %u, matched %u, dropped %u, "
-			     "lost %u, again %u", WAVE_NAME(wave_mode),
-			     __atomic_load_n(&wave_env.ours, __ATOMIC_RELAXED),
-			     __atomic_load_n(&wave_env.stock, __ATOMIC_RELAXED),
-			     __atomic_load_n(&wave_env.ov_ours, __ATOMIC_RELAXED),
-			     __atomic_load_n(&wave_env.ov_stock, __ATOMIC_RELAXED), cached, wave_cache.matched,
-			     wave_cache.dropped, wave_qlost, wave_reread);
-		}
 	}
 	return NULL;
 }
@@ -1598,10 +1369,6 @@ static const uint16_t L_FPS[] = u"DISPLAY REFRESH";
 static const uint16_t V_FPS20[] = u"20 FPS (ORIGINAL)";
 static const uint16_t V_FPS30[] = u"30 FPS";
 static const uint16_t *const fps_vals[GUI_RATES] = { V_FPS20, V_FPS30 };
-static const uint16_t L_NEXT[] = u"NEXT START";
-static const uint16_t V_FULL[] = u"FULL MOD";
-static const uint16_t V_MEASURE[] = u"MEASURE ONLY";
-static const uint16_t *const next_vals[2] = { V_FULL, V_MEASURE };
 static const uint16_t L_SCROLL[] = u"WAVEFORM SCROLL";
 static const uint16_t V_ORIGINAL[] = u"ORIGINAL";
 static const uint16_t V_SMOOTH[] = u"SMOOTH";
@@ -1611,15 +1378,6 @@ static const uint16_t V_BLUE[] = u"BLUE (ORIGINAL)";
 static const uint16_t V_RGB[] = u"RGB";
 static const uint16_t V_3BAND[] = u"3-BAND";
 static const uint16_t *const wave_vals[3] = { V_BLUE, V_RGB, V_3BAND };
-static const uint16_t L_SYNC[] = u"SCREEN SYNC";
-static const uint16_t V_SYNC_PIONEER[] = u"PIONEER";
-static const uint16_t V_SYNC_REFRESH[] = u"AT REFRESH";
-static const uint16_t V_SYNC_15[] = u"1.5 MS EARLIER";
-static const uint16_t V_SYNC_30[] = u"3.0 MS EARLIER";
-static const uint16_t V_SYNC_45[] = u"4.5 MS EARLIER";
-static const uint16_t V_SYNC_60[] = u"6.0 MS EARLIER";
-static const uint16_t *const sync_vals[SYNC_MODES] = { V_SYNC_PIONEER, V_SYNC_REFRESH, V_SYNC_15, V_SYNC_30, V_SYNC_45,
-						       V_SYNC_60 };
 static const uint16_t L_BJA[] = u"BEAT JUMP A";
 static const uint16_t L_BJB[] = u"BEAT JUMP B";
 static const uint16_t V_BJ1[] = u"1 BEAT";
@@ -1634,12 +1392,11 @@ static const uint16_t V_JOG_TOUCH[] = u"TOUCH";
 static const uint16_t V_JOG_ONAIR[] = u"ON AIR";
 static const uint16_t *const jog_vals[JOG_MODES] = { V_JOG_TOUCH, V_JOG_ONAIR };
 #define UT_LABEL_ON_AIR_DISPLAY	0x39e4c0u	/* Pioneer's "ON AIR DISPLAY" (menu item 4) */
-#define UT_CAP (UT_MAX + 3)	/* WAVE 11 fills Pioneer's 16 + 8 = 24; beat jump adds two, JOG LIGHT one */
+#define UT_CAP (UT_MAX + 3)	/* room for Pioneer's 16 items and ours */
 static struct { uint32_t count; uint8_t items[UT_CAP * UT_ITEM_LEN]; } __attribute__((aligned(8))) ut_table;
 
 /* Called by rbp's UI: like Pioneer's display functions, show the edited value while editing, else the live
- * setting (which SHIFT + CUE may have changed meanwhile, in the builds that have it). out = two text buffers: label,
- * value. */
+ * setting. out = two text buffers: label, value. */
 static int ut_show(uint8_t *it, uint8_t **out, const uint16_t *label, const uint16_t *const *vals, int count,
 		   int live)
 {
@@ -1679,11 +1436,6 @@ static int ut_fps_display(uint8_t *it, uint8_t **out)
 	return ut_show(it, out, L_FPS, fps_vals, GUI_RATES, fps_sel);
 }
 
-static int ut_next_display(uint8_t *it, uint8_t **out)
-{
-	return ut_show(it, out, L_NEXT, next_vals, 2, measure_next);
-}
-
 static int ut_scroll_display(uint8_t *it, uint8_t **out)
 {
 	return ut_show(it, out, L_SCROLL, scroll_vals, 2, scroll_sel);
@@ -1711,21 +1463,6 @@ static int ut_wave_commit(uint8_t *it)
 	wave_set(v);	/* one aligned word: the next column uses it */
 	mode_dirty = 1;
 	note("menu: waveform color %s", WAVE_NAME(v));
-	return 1;
-}
-
-static int ut_sync_display(uint8_t *it, uint8_t **out)
-{
-	return ut_show(it, out, L_SYNC, sync_vals, SYNC_MODES, sync_sel);
-}
-
-static int ut_sync_commit(uint8_t *it)
-{
-	int32_t v;
-	if (!ut_commit(it, &v)) return 0;
-	sync_sel = v;	/* one aligned word: gui_task's next wait uses the lead, the sync thread switches on or off */
-	mode_dirty = 1;
-	note("menu: screen sync %s", SYNC_LABEL(v));
 	return 1;
 }
 
@@ -1771,16 +1508,6 @@ static int ut_jog_commit(uint8_t *it)
 	jog_mode = v;	/* one aligned word: the UI thread's next tick uses it */
 	mode_dirty = 1;
 	note("menu: jog light %s", v == JOG_ONAIR ? "on air" : "touch");
-	return 1;
-}
-
-static int ut_next_commit(uint8_t *it)
-{
-	int32_t v;
-	if (!ut_commit(it, &v)) return 0;
-	measure_next = v;
-	mode_dirty = 1;
-	note("menu: next start %s", v ? "measure only" : "full mod");
 	return 1;
 }
 
@@ -1836,19 +1563,11 @@ static int ut_cue_commit(uint8_t *it)
 	return 1;
 }
 
-/* rbp's UI events (dispatcher 0xe5d34): set_flg(*UI_FLG_ID, bit) ORs the bit into an event pattern and posts a semaphore;
- * bit 0x40000 is "TOTAL_EVENT UTILITY_UPDATE", which makes an open Utility screen redraw (and so re-read our
- * values). Pioneer calls it unlocked from its own threads; we call it only from rbp's panel thread. */
-#define UI_SET_FLG		0x115f5cu
-#define UI_FLG_ID		0x17eb2e4u
-#define UI_UTILITY_UPDATE	0x40000u
-
-
 static void menu_install(void)
 {
-	uint8_t a[UT_ITEM_LEN], b[UT_ITEM_LEN], c[UT_ITEM_LEN], d[UT_ITEM_LEN], e[UT_ITEM_LEN], f[UT_ITEM_LEN];
+	uint8_t a[UT_ITEM_LEN], b[UT_ITEM_LEN], c[UT_ITEM_LEN], d[UT_ITEM_LEN], e[UT_ITEM_LEN];
 	uint8_t h[UT_ITEM_LEN];
-	uint8_t g[UT_ITEM_LEN], sy[UT_ITEM_LEN];
+	uint8_t g[UT_ITEM_LEN];
 	uint8_t ja[UT_ITEM_LEN], jb[UT_ITEM_LEN], jl[UT_ITEM_LEN];
 	struct ut_ins ins[13];
 	uint32_t after_fps = (uint32_t)(uintptr_t)L_FPS;
@@ -1880,11 +1599,6 @@ static void menu_install(void)
 		ut_item(e, (uint32_t)(uintptr_t)L_FPS, (uint32_t)(uintptr_t)fps_vals, GUI_RATES,
 			(uint32_t)(uintptr_t)ut_fps_display, (uint32_t)(uintptr_t)ut_fps_commit);
 		ins[k++] = (struct ut_ins){ e, UT_LABEL_LCD_BRIGHTNESS, 0 };
-		if (!XDJMOD_EVENT) {	/* NEXT START after DISPLAY REFRESH: measure only is about the frame meter */
-			ut_item(f, (uint32_t)(uintptr_t)L_NEXT, (uint32_t)(uintptr_t)next_vals, 2,
-				(uint32_t)(uintptr_t)ut_next_display, (uint32_t)(uintptr_t)ut_next_commit);
-			ins[k++] = (struct ut_ins){ f, (uint32_t)(uintptr_t)L_FPS, 0 };
-		}
 	}
 	if (wave_ok) {	/* after DISPLAY REFRESH, or after LCD BRIGHTNESS without it */
 		ut_item(g, (uint32_t)(uintptr_t)L_WAVE, (uint32_t)(uintptr_t)wave_vals, 3,
@@ -1896,11 +1610,6 @@ static void menu_install(void)
 		ut_item(h, (uint32_t)(uintptr_t)L_SCROLL, (uint32_t)(uintptr_t)scroll_vals, 2,
 			(uint32_t)(uintptr_t)ut_scroll_display, (uint32_t)(uintptr_t)ut_scroll_commit);
 		ins[k++] = (struct ut_ins){ h, after_fps, 0 };
-	}
-	if (gui_ok && !XDJMOD_GIG) {	/* SCREEN SYNC: last of the display entries (fixed in the gig build) */
-		ut_item(sy, (uint32_t)(uintptr_t)L_SYNC, (uint32_t)(uintptr_t)sync_vals, SYNC_MODES,
-			(uint32_t)(uintptr_t)ut_sync_display, (uint32_t)(uintptr_t)ut_sync_commit);
-		ins[k++] = (struct ut_ins){ sy, pos_ok ? (uint32_t)(uintptr_t)L_SCROLL : after_fps, 0 };
 	}
 	if (bj_ok) {	/* after CUE MODE: BEAT JUMP A, BEAT JUMP B */
 		ut_item(ja, (uint32_t)(uintptr_t)L_BJA, (uint32_t)(uintptr_t)bj_vals, BJ_SIZES,
@@ -1936,22 +1645,21 @@ static void menu_install(void)
 	boot_note("menu: code not writable (errno %d), not installed", errno);
 }
 
-/* Is a beat jump subpage showing its LEDs? Caller holds led_lock. */
+/* Do the mod's LED bits apply (a beat jump subpage shows, or JOG LIGHT is ON AIR)? Caller holds led_lock. */
 static int led_bj_on(void)
 {
 	return bj_led_sent[0] || bj_led_sent[1] || oa_sent;
 }
 
-/* Send rbp's latest LED frame, with byte 10 replaced if the CUE override is on and the beat jump subpage bits if a
- * subpage shows. Caller holds led_lock. */
+/* Send rbp's latest LED frame, with the mod's bits (beat jump subpage, jog light) where those are on. Caller holds
+ * led_lock. */
 static int led_send(int fd, unsigned long req, const struct subucom_xfer *x, const uint8_t *frame)
 {
 	uint8_t f[128];
 	struct subucom_xfer y = *x;
 	unsigned len = x->bytes < sizeof f ? x->bytes : sizeof f;
 	memcpy(f, frame, len);
-	if (led_active || led_bj_on()) {
-		if (led_active) f[PANEL_TX_CUE_BYTE] = led_last;
+	if (led_bj_on()) {
 		if (len >= LED_BYTES) {
 			bj_led_apply(f, 0, bj_led_sent[0]);
 			bj_led_apply(f, 1, bj_led_sent[1]);
@@ -1970,7 +1678,8 @@ static int is_led_msg(unsigned long req, const void *arg)
 	       x->multi_id == 0 && x->part_id == 0 && x->bytes >= PANEL_TX_MIN_LEN && x->bytes <= sizeof led_rbp;
 }
 
-/* rbp sends an LED frame: remember it, and keep the override on it while SHIFT is held. */
+/* rbp sends an LED frame: remember it, and send it with the mod's bits (beat jump subpage, jog light) while those
+ * are on. */
 static int led_ioctl(int fd, unsigned long req, void *arg)
 {
 	const struct subucom_xfer *x = arg;
@@ -1982,7 +1691,7 @@ static int led_ioctl(int fd, unsigned long req, void *arg)
 	led_req = req;
 	led_have = 1;
 	cue_leds = led_rbp[PANEL_TX_CUE_BYTE];
-	r = led_active || led_bj_on() ? led_send(fd, req, x, led_rbp) : real_ioctl(fd, req, arg);
+	r = led_bj_on() ? led_send(fd, req, x, led_rbp) : real_ioctl(fd, req, arg);
 	pthread_mutex_unlock(&led_lock);
 	return r;
 }
@@ -1990,7 +1699,6 @@ static int led_ioctl(int fd, unsigned long req, void *arg)
 static void led_update(uint64_t t)
 {
 	uint8_t bj_now[2] = { bj_led_now(0, t), bj_led_now(1, t) }, oa = oa_led_now(t);
-	enum { want = 0 };	/* EVENT 3: no SHIFT + CUE, the CUE LEDs are always rbp's */
 	pthread_mutex_lock(&led_lock);
 	if (led_have) {
 		int send = 0, d;
@@ -2003,24 +1711,10 @@ static void led_update(uint64_t t)
 			oa_sent = oa;			/* 0: the jog lights back to rbp's touch light */
 			send = 1;
 		}
-		if (want) {
-			uint8_t b = hp_led_byte(led_rbp[PANEL_TX_CUE_BYTE], hp_mode, t);
-			if (!led_active || b != led_last) {
-				led_active = 1;
-				led_last = b;
-				send = 1;
-			}
-		} else if (led_active) {
-			led_active = 0;	/* back to rbp's own frame */
-			send = 1;
-		}
 		if (send) led_send(led_fd, led_req, &led_x, led_rbp);
 	}
 	pthread_mutex_unlock(&led_lock);
 }
-
-
-
 
 static void *ui_thread(void *unused)
 {
@@ -2072,7 +1766,6 @@ static void *ui_thread(void *unused)
 	}
 	return NULL;
 }
-
 
 /* ---------- libc wrappers ---------- */
 
@@ -2135,19 +1828,6 @@ EXPORT int close(int fd)
 		fd_class[fd] = FD_NONE;	/* before the fd number can be reused */
 	return real_close(fd);
 }
-
-
-
-/* i2c-dev ioctls (linux/i2c-dev.h) */
-#define I2C_SLAVE 0x0703
-#define I2C_SLAVE_FORCE 0x0706
-#define I2C_RDWR 0x0707
-#define I2C_SMBUS 0x0720
-struct i2c_msg_ { uint16_t addr, flags, len; uint8_t *buf; };
-struct i2c_rdwr_ { struct i2c_msg_ *msgs; uint32_t nmsgs; };
-struct i2c_smbus_ { uint8_t read_write, command; uint32_t size; uint8_t *data; };
-
-
 
 EXPORT int ioctl(int fd, unsigned long req, ...)
 {
@@ -2299,7 +1979,7 @@ static void pcm_err(struct pcm_slot *s, long r, unsigned long frames)
 	ev_commit(e);
 }
 
-/* The gig build's audio path: MASTER/BOOTH MONO where on (or fading off), the master's periods for the safe start;
+/* The audio path: MASTER/BOOTH MONO where on (or fading off), the master's periods for the safe start;
  * nothing measured, no clock read. */
 EXPORT long snd_pcm_writei(void *h, const void *buf, unsigned long frames)
 {
@@ -2411,7 +2091,7 @@ static void out_flush(void)
 	}
 	outlen = 0;
 	if (written_total >= WRITE_CAP && !cap_noted) {
-		cap_noted = 1;	/* the state file says so; the log is full */
+		cap_noted = 1;	/* the log is full: nothing more is written */
 	}
 }
 
@@ -2536,24 +2216,18 @@ static void format_event(const struct ev *e)
 	out_append(line);
 }
 
-
-
-/* ---- Health log and safe start (0.6, for long tests) ----
- * Since 0.9 all of the log (health, per-second audio stats, display measurement, screenshots) runs only while
- * the xdjmod-capture folder is on a stick; safe start always runs.
- * Once a minute: CPU per core and of rbp, memory, temperature, CPU clock, xruns; then the display activity per
- * screen band for 3 s (how often each band is redrawn); two screenshots per session. Lowest priority, core 0.
+/* ---- Log and safe start ----
+ * The log (start-up, settings changes, errors) is written only while the xdjmod-capture folder is on a stick; the
+ * safe start always runs.
  * Safe start: apl_start writes the marker XDJMOD_STARTING before starting rbp with the library and starts rbp
  * without it if the marker is still there. The library removes it once rbp has run 60 s with the master
  * running. So a start that hangs, or one switched off within the first minute, makes the next start pure
  * Pioneer (and that one clears the marker again). */
 static char starting_path[128];
 
-
-/* The gig build's log thread: once a second the notes go to the capture folder (kept in memory until there is one,
- * up to OUT_BUF); every 5 s it looks for the folder (and, before EVENT 3c, for device fds rbp didn't open through
- * open()); and it runs
- * the safe start (see starting_path): healthy if the master wrote over 100 periods in the 2 s after minute 1. */
+/* The log thread (lowest priority, core 0): once a second the notes go to the capture folder (kept in memory until
+ * there is one, up to OUT_BUF); every 5 s it looks for the folder; and it runs the safe start (see starting_path):
+ * healthy if the master wrote over 100 periods in the 2 s after minute 1. */
 static void *gig_log_thread(void *unused)
 {
 	cpu_set_t cpus;
@@ -2651,7 +2325,7 @@ __attribute__((constructor)) static void xdjmod_init(void)
 	{
 		boot_note("a symbol is missing (open=%p pcm_open=%p writei=%p): pass-through", (void *)real_open,
 			  (void *)real_pcm_open, (void *)real_pcm_writei);
-		return;	/* a symbol is missing: never pretend to observe */
+		return;	/* a symbol is missing: stay a pass-through */
 	}
 
 	t0_us = now_us();
@@ -2673,7 +2347,7 @@ __attribute__((constructor)) static void xdjmod_init(void)
 		pthread_mutex_init(&led_lock, &ma);
 		pthread_mutexattr_destroy(&ma);
 		mode_load();
-		if (measure_next) {	/* one-shot: cleared before anything else, so the next start is the full mod */
+		if (measure_next) {	/* never: measure_next is always 0 */
 			measure_only = 1;
 			measure_next = 0;
 			mode_save();
@@ -2693,7 +2367,7 @@ __attribute__((constructor)) static void xdjmod_init(void)
 		if (wave_ok && pthread_create(&th, &attr, wave_thread, NULL) != 0)
 			note("wave: thread failed (Pioneer's colours only)");
 		note("waveform: sequence %d, overview %d, %s", wave_ok, ov_ok, WAVE_NAME(wave_mode));
-		if (gui_ok && !measure_only) {	/* SCREEN SYNC (WAVE 10): idle while the setting is PIONEER */
+		if (gui_ok && !measure_only) {	/* SCREEN SYNC, always on (SYNC_GIG) */
 			pthread_attr_t sa;
 			pthread_attr_init(&sa);
 			pthread_attr_setstacksize(&sa, 64 * 1024);

@@ -53,16 +53,22 @@ What the library does inside `rbp`:
   the expected ones for firmware 2.21. If they don't match, it changes nothing.
 - **Keeps the audio thread real-time safe.** On the audio thread it only does arithmetic and lock-free stores: no
   allocation, no locks, no file access.
-- **Writes a log only on request.** It writes `hook.log` only while a folder `xdjmod-capture` exists on a stick.
+- **Writes a log only on request.** It writes `hook.log` (start-up, settings changes, errors) only while a folder
+  `xdjmod-capture` exists on a stick. Until then a low-priority thread keeps the notes in memory and looks for the
+  folder every 5 seconds. A few start-up lines also go to RAM (`/dev/shm/xdjmod-boot.txt`); nothing else is written.
+- **Screen sync.** A thread of its own keeps the phase of the screen's refresh, and the copy of each finished frame
+  starts 4.5 ms before the refresh, so the picture doesn't tear. This is always on and has no UTILITY entry.
 
-The settings live in UTILITY and are saved in `/root/rbp/xdjmod-hpmode`.
+The settings live in UTILITY and are saved in `/root/rbp/xdjmod-hpmode`. R1 doesn't remove that file (it only
+writes the app area); Pioneer's software ignores it.
 
 ### Source
 
 - `xdjmod.c`: the part that runs inside `rbp`. Wrappers, patches, settings, waveforms, beat jump.
 - `xdjmod_core.h`: the logic that doesn't depend on Linux or on `rbp`.
 
-This is the release build's source: the build switches at the top of `xdjmod.c` are fixed to XDJRX-MOD 1.0.
+This is the source of exactly the released library, nothing else: the development builds' measurement and test
+code isn't in it, and the comments describe this version.
 
 ### Build
 

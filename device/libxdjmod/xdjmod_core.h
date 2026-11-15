@@ -1,11 +1,11 @@
 /*
- * libxdjmod core: the parts that do not depend on Linux or on being inside
- * rbp, so they can be unit-tested on the Mac (tests/test_core.c).
+ * libxdjmod core: the parts that need neither Linux nor rbp's process, so they can be tested off the device:
  *
- * - peak metering of interleaved PCM buffers (audio thread, allocation-free)
- * - a seqlock for publishing per-second statistics from the audio thread
- * - a lock-free multi-producer event ring (drops when full, never blocks)
- * - text formatting of events and statistics (log thread only)
+ * - a seqlock and a lock-free multi-producer event ring (drops when full, never blocks) for the log
+ * - the settings file
+ * - the code sequences the library installs in rbp, with the instructions and addresses they rely on
+ * - the logic of the cue modes, mono, the meter switch, the frame rate, SCREEN SYNC, the waveform scroll,
+ *   colour waveforms, beat jump and the jog light
  */
 #ifndef XDJMOD_CORE_H
 #define XDJMOD_CORE_H
@@ -37,92 +37,7 @@ static inline const char *fmt_name(int fmt)
 	}
 }
 
-/* ---------- peak metering ---------- */
-
-#define MAX_CH 8
-
-/* Full scale is 2^31 for every format; peaks are kept as uint32 magnitudes. */
-static inline uint32_t mag32(int32_t v)
-{
-	return v < 0 ? (uint32_t)0 - (uint32_t)v : (uint32_t)v;	/* INT32_MIN -> 2^31 */
-}
-
-/*
- * Update per-channel peaks from an interleaved buffer. Unknown formats are
- * ignored. Cost: one load, shift and compare per sample.
- */
-static inline void peak_update(uint32_t *peak, const void *buf, unsigned long frames,
-			       unsigned channels, int fmt)
-{
-	unsigned ch_used = channels < MAX_CH ? channels : MAX_CH;
-	unsigned long i;
-	unsigned c;
-
-	if (!buf || channels == 0)
-		return;
-	switch (fmt) {
-	case FMT_S16_LE: {
-		const int16_t *s = (const int16_t *)buf;
-		for (i = 0; i < frames; i++, s += channels)
-			for (c = 0; c < ch_used; c++) {
-				uint32_t m = mag32((int32_t)s[c] * 65536);
-				if (m > peak[c]) peak[c] = m;
-			}
-		break;
-	}
-	case FMT_S24_LE: {
-		const int32_t *s = (const int32_t *)buf;
-		for (i = 0; i < frames; i++, s += channels)
-			for (c = 0; c < ch_used; c++) {
-				int32_t v = (int32_t)((uint32_t)s[c] << 8);	/* drop the unused top byte, keep the sign */
-				uint32_t m = mag32(v);
-				if (m > peak[c]) peak[c] = m;
-			}
-		break;
-	}
-	case FMT_S32_LE: {
-		const int32_t *s = (const int32_t *)buf;
-		for (i = 0; i < frames; i++, s += channels)
-			for (c = 0; c < ch_used; c++) {
-				uint32_t m = mag32(s[c]);
-				if (m > peak[c]) peak[c] = m;
-			}
-		break;
-	}
-	case FMT_S24_3LE: {
-		const uint8_t *s = (const uint8_t *)buf;
-		for (i = 0; i < frames; i++, s += 3 * channels)
-			for (c = 0; c < ch_used; c++) {
-				const uint8_t *p = s + 3 * c;
-				int32_t v = (int32_t)(((uint32_t)p[0] << 8) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 24));
-				uint32_t m = mag32(v);
-				if (m > peak[c]) peak[c] = m;
-			}
-		break;
-	}
-	case FMT_FLOAT_LE: {
-		const float *s = (const float *)buf;
-		for (i = 0; i < frames; i++, s += channels)
-			for (c = 0; c < ch_used; c++) {
-				float a = s[c] < 0 ? -s[c] : s[c];
-				uint32_t m = a >= 1.0f ? 0x80000000u : (uint32_t)(a * 2147483648.0f);
-				if (m > peak[c]) peak[c] = m;
-			}
-		break;
-	}
-	default:
-		break;
-	}
-}
-
-/* "-6.0", "0.0" or "-inf" (dBFS, full scale = 2^31). */
-static inline void fmt_db(char *out, size_t n, uint32_t peak)
-{
-	if (peak == 0)
-		snprintf(out, n, "-inf");
-	else
-		snprintf(out, n, "%.1f", 20.0 * log10((double)peak / 2147483648.0));
-}
+#define MAX_CH 8	/* channels per PCM stream (struct pcm_acc) */
 
 /* ---------- seqlock (one writer, one reader, writer never waits) ---------- */
 
@@ -278,14 +193,6 @@ struct pcm_acc {
 	uint32_t peak[MAX_CH];
 };
 
-struct thr_acc {		/* the thread that does PCM I/O */
-	int32_t tid;
-	uint32_t cycles;	/* gaps measured */
-	uint64_t busy_us;	/* time between leaving one ALSA call and entering the next */
-	uint32_t gap_max;
-	uint64_t span_us;	/* window length */
-};
-
 struct pcm_hw {
 	int32_t format;
 	uint32_t channels, rate;
@@ -323,44 +230,14 @@ static inline unsigned frame_diff(char *out, size_t n, const uint8_t *prev, cons
 	return changed;
 }
 
-static inline void fmt_pcm_line(char *out, size_t n, double t, int slot, const char *name, int stream,
-				const struct pcm_acc *a, unsigned channels)
-{
-	char peaks[MAX_CH * 8] = "";
-	size_t o = 0;
-	unsigned c, ch = channels < MAX_CH ? channels : MAX_CH;
-	for (c = 0; c < ch; c++) {
-		char db[16];
-		fmt_db(db, sizeof db, a->peak[c]);
-		o += (size_t)snprintf(peaks + o, sizeof peaks - o, "%s%s", c ? "," : "", db);
-	}
-	snprintf(out, n,
-		 "%9.3f pcm%d %s %s calls=%u frames=%u int_us=%u/%u/%u in_us=%u/%u xrun=%u err=%u short=%u peak_dbfs=%s\n",
-		 t, slot, name, stream ? "capture" : "playback", a->calls, a->frames,
-		 a->int_n ? a->int_min : 0, a->int_n ? (unsigned)(a->int_sum / a->int_n) : 0, a->int_max,
-		 a->calls ? (unsigned)(a->in_sum / a->calls) : 0, a->in_max,
-		 a->xruns, a->errors, a->short_io, ch ? peaks : "-");
-}
-
-
-/* ---------- panel: headphone cue mode switch ----------
- * Input frames (read() on /dev/subucom_spi1.0, 100 bytes): SHIFT deck 1 = byte 18 bit 0x01,
- * CUE CH1 = byte 91 bit 0x02, CUE CH2 = byte 91 bit 0x01. rbp checks a CRC in bytes 98/99, so input
- * frames are never edited: a hidden press is replaced by the last frame passed on unchanged.
- * LED frames (SUBUCOM_IOC_MESSAGE, multi 0 part 0): CUE CH1 LED = byte 10 bit 0x20, CUE CH2 LED =
+/* ---------- panel: LED frames and the cue mode ----------
+ * LED frames (SUBUCOM_IOC_MESSAGE on /dev/subucom_spi*, multi 0 part 0): CUE CH1 LED = byte 10 bit 0x20, CUE CH2 LED =
  * byte 10 bit 0x10; CRC-16/X-25 over bytes 0..19 with each 32-bit word byte-swapped, little-endian
  * in bytes 22/23 (verified on 340 recorded frames). */
-#define PANEL_RX_LEN		100
-#define PANEL_RX_SHIFT_BYTE	18
-#define PANEL_RX_SHIFT_BIT	0x01
-#define PANEL_RX_CUE_BYTE	91
-#define PANEL_RX_CUE1_BIT	0x02
-#define PANEL_RX_CUE2_BIT	0x01
 #define PANEL_TX_MIN_LEN	24
 #define PANEL_TX_CUE_BYTE	10
 #define PANEL_TX_CUE1_BIT	0x20
 #define PANEL_TX_CUE2_BIT	0x10
-#define HP_BLINK_US		333333u	/* 3 blinks per second */
 
 /* Cue modes, also the Utility menu's value order: NORMAL = Pioneer's blend, SPLIT = Pioneer's built-in split
  * (always split), SPLIT STEREO = PX5/A&H style (split only while a channel is cued, else master in stereo). */
@@ -385,49 +262,6 @@ static inline void panel_tx_seal(uint8_t *f)
 	f[23] = (uint8_t)(c >> 8);
 }
 
-/* LED byte 10 while SHIFT is held: the active mode's CUE LED blinks, the other one is off. */
-static inline uint8_t hp_led_byte(uint8_t orig, int mode, uint64_t t_us)
-{
-	uint8_t on = mode != HP_NORMAL ? PANEL_TX_CUE2_BIT : PANEL_TX_CUE1_BIT;
-	int lit = (t_us % HP_BLINK_US) < HP_BLINK_US / 2;
-	return (uint8_t)((orig & ~(PANEL_TX_CUE1_BIT | PANEL_TX_CUE2_BIT)) | (lit ? on : 0));
-}
-
-struct hp_switch {
-	uint8_t pass[PANEL_RX_LEN];	/* the last frame handed to rbp unchanged */
-	int pass_valid;
-	uint8_t prev_cues;		/* CUE bits of the previous raw frame */
-	uint8_t captured;		/* CUE bits pressed together with SHIFT, hidden until released */
-	int shift;			/* SHIFT deck 1 held (raw) */
-};
-
-/* Called with every input frame rbp reads, before rbp sees it. enabled = switching may happen.
- * Returns HP_NORMAL (SHIFT + CUE CH1), HP_SPLIT (SHIFT + CUE CH2: "a split mode", the caller picks which) or -1; *hidden = 1 if the frame was replaced. */
-static inline int hp_switch_rx(struct hp_switch *s, uint8_t *f, size_t n, int enabled, int *hidden)
-{
-	uint8_t cues, newly;
-	int mode = -1;
-	*hidden = 0;
-	if (n != PANEL_RX_LEN) return -1;
-	s->shift = (f[PANEL_RX_SHIFT_BYTE] & PANEL_RX_SHIFT_BIT) != 0;
-	cues = f[PANEL_RX_CUE_BYTE] & (PANEL_RX_CUE1_BIT | PANEL_RX_CUE2_BIT);
-	newly = (uint8_t)(cues & ~s->prev_cues);
-	s->prev_cues = cues;
-	if (enabled && s->shift && newly) {
-		s->captured |= newly;
-		mode = (newly & PANEL_RX_CUE2_BIT) ? HP_SPLIT : HP_NORMAL;
-	}
-	s->captured &= cues;	/* a released button is no longer hidden */
-	if (s->captured && s->pass_valid) {
-		memcpy(f, s->pass, PANEL_RX_LEN);
-		*hidden = 1;
-	} else {
-		memcpy(s->pass, f, PANEL_RX_LEN);
-		s->pass_valid = 1;
-	}
-	return mode;
-}
-
 /* The mode word for HeadPhone+0x2c (1 = stereo blend, 0 = split). SPLIT always splits (Pioneer); SPLIT STEREO
  * splits only while a channel is cued, like the PX5. cue_leds = byte 10 of rbp's own LED frame. */
 static inline uint32_t hp_mode_word(int mode, uint8_t cue_leds)
@@ -439,30 +273,30 @@ static inline uint32_t hp_mode_word(int mode, uint8_t cue_leds)
 
 /* Settings file (/root/rbp/xdjmod-hpmode), one key per line:
  *     mode=normal|split|split-stereo   the cue mode
- *     split=split|split-stereo         which split SHIFT + CUE CH2 selects (the last split used)
+ *     split=split|split-stereo         the last split mode chosen
  *     meter=pre|post                   master level display before/after MASTER LEVEL
  *     master-mono=yes|no, booth-mono=yes|no
- *     fps=20|30|40|60                  screen frame rate (gui_task)
- *     next=measure                     one-shot: next start with the frame meter only (cleared at that start)
- *     waveform=blue|rgb|3band          waveform colours (wave builds; written only when not blue)
+ *     fps=20|30                        screen frame rate (gui_task); 40 and 60 read as 30
+ *     waveform=blue|rgb|3band          waveform colours (written only when not blue)
  *     scroll=original|smooth           big waveform position (written only when smooth)
- *     sync=refresh|1.5|3.0|4.5|6.0     SCREEN SYNC (wave builds; written only when not pioneer)
- * Files of 0.1-0.3 hold just "split" (= the PX5 behaviour, now SPLIT STEREO) or "normal". */
+ *     jog-light=on-air, beatjump-a=…, beatjump-b=…   (oa_settings_parse, bj_settings_parse)
+ * Read for compatibility with earlier mod versions, without effect here: next=measure (a one-shot test mode) and
+ * sync=… (SCREEN SYNC is fixed at 4.5 ms). The earliest files hold just "split" (= SPLIT STEREO) or "normal". */
 /* Screen frame rates offered in the menu, index = setting. Index 0 = Pioneer's 20 fps. The screen never
- * gets above 30 (each frame costs ~17 ms of drawing, then waits for the next 60 Hz refresh), so 40/60 were dropped;
- * settings files from 0.7 with fps=40/60 read as 30. */
+ * gets above 30 (each frame costs ~17 ms of drawing, then waits for the next 60 Hz refresh). */
 #define GUI_RATES 2
 static const char *const xdj_fps_name[GUI_RATES] = { "20", "30" };
-/* SCREEN SYNC (WAVE 10, see sync_next): Pioneer's refresh wait, at the refresh, or that many ms before it */
+/* SCREEN SYNC (see sync_next): Pioneer's refresh wait, at the refresh, or that many ms before it. The library always
+ * uses 4.5 (SYNC_GIG); the others are only names for the settings file. */
 #define SYNC_MODES 6
 static const char *const xdj_sync_name[SYNC_MODES] = { "pioneer", "refresh", "1.5", "3.0", "4.5", "6.0" };
 
 struct xdj_settings {
 	int mode, split, meter_pre, master_mono, booth_mono, fps;
-	int measure_next;	/* one-shot: the next start loads only the frame meter (0.10) */
+	int measure_next;	/* next=measure from an earlier version's file; the library ignores it */
 	int wave;		/* WAVE_BLUE / WAVE_RGB / WAVE_3BAND */
 	int scroll;		/* 0 Pioneer's position, 1 SMOOTH (the position at draw time) */
-	int sync;		/* SCREEN SYNC: index into xdj_sync_name (0 = Pioneer's refresh wait) */
+	int sync;		/* sync=… from an earlier version's file; the library ignores it */
 };
 #define WAVE_BLUE 0
 #define WAVE_RGB 1
@@ -503,7 +337,7 @@ static inline void xdj_settings_parse(struct xdj_settings *st, const char *txt, 
 {
 	const char *p = txt, *end = txt + n;
 	xdj_settings_default(st);
-	if (xdj_word(p, end, "split")) {	/* 0.1-0.3 */
+	if (xdj_word(p, end, "split")) {	/* the earliest files */
 		st->mode = HP_SPLIT_STEREO;
 		return;
 	}
@@ -529,7 +363,7 @@ static inline void xdj_settings_parse(struct xdj_settings *st, const char *txt, 
 			int k;
 			for (k = 0; k < GUI_RATES; k++)
 				if (xdj_word(p + 4, eol, xdj_fps_name[k])) st->fps = k;
-			if (xdj_word(p + 4, eol, "40") || xdj_word(p + 4, eol, "60")) st->fps = 1;	/* 0.7 */
+			if (xdj_word(p + 4, eol, "40") || xdj_word(p + 4, eol, "60")) st->fps = 1;	/* 40/60 from older files */
 		} else if (eol - p > 5 && !strncmp(p, "next=", 5)) {
 			st->measure_next = xdj_word(p + 5, eol, "measure");
 		} else if (eol - p > 11 && !strncmp(p, "booth-mono=", 11)) {
@@ -603,22 +437,6 @@ static inline int hp_stereo_gain_plausible(uint32_t bits)
 	        g < bits_f32(HP_STEREO_GAIN_BITS));
 }
 
-/* Trim file content: the attenuation in whole dB, "4", "-4" or "4 dB" alike, 0..HP_TRIM_MAX. Else -1. */
-static inline int hp_parse_trim(const char *txt, size_t n)
-{
-	size_t i = 0;
-	int v = 0, digits = 0;
-	while (i < n && (txt[i] == ' ' || txt[i] == '\t')) i++;
-	if (i < n && (txt[i] == '-' || txt[i] == '+')) i++;
-	while (i < n && txt[i] >= '0' && txt[i] <= '9' && digits < 3) {
-		v = v * 10 + (txt[i++] - '0');
-		digits++;
-	}
-	if (!digits || v > HP_TRIM_MAX || (i < n && txt[i] >= '0' && txt[i] <= '9')) return -1;
-	return v;
-}
-
-
 /* ---- Master level display, switchable ----
  * MasterOutChannel::process measures the meter peak at 0x664a8 with vabs d17,d16 (after MASTER LEVEL); the
  * A&H variant is vabs d17,d17 (the bus before it). Rewriting that instruction while the audio thread runs isn't
@@ -659,8 +477,8 @@ static inline void mtr_cave_build(uint32_t *w, uint32_t flag_addr)
  * gui_task (0xb3a68) draws a frame, measures how long it took (dt, ms) and sleeps 50 - dt: 20 fps.
  *     b3aac: cmp r4, #49      b3ab0: bls b3ad8      b3ad8: rsb r0, r4, #50      b3adc: bl dly_tsk (0x125a50)
  * Installed once in the constructor (no thread runs yet): b3aac becomes a branch to a sequence at 0x59ea8 (the
- * never-called function after the meter sequence). Since 0.10 it calls a C function gui_frame(dt) in the library
- * that returns the sleep in ms (gui_sleep_ms) and feeds the frame meter, then sleeps if that's > 0 and goes on at
+ * never-called function after the meter sequence). It calls a C function gui_frame(dt) in the library that
+ * returns the sleep in ms (gui_sleep_ms), then sleeps if that's > 0 and goes on at
  * b3ab4. b3ab4 is a bl, and Pioneer's own path reaches it after bl dly_tsk, so nothing after it relies on r0-r3,
  * r12 or lr; sp is 8-byte aligned there (push {r4, lr}; sub sp, #8). */
 #define GUI_SITE	0xb3aacu
@@ -707,36 +525,15 @@ static inline uint32_t gui_sleep_ms(uint32_t dt, uint32_t period, int *prev_late
 	return was ? GUI_MIN_SLEEP : 0;
 }
 
-/* Display refresh (vsync, 0.11): where in the refresh cycle a frame finishes. t and vs are the low 32 bits of
- * CLOCK_MONOTONIC in us (differences wrap correctly), period in us. -1 = no usable vsync (none yet, or the last one
- * is older than 3 periods, i.e. the vsync thread stalled). */
-#define VS_BINS 17	/* 1 ms bins over one 60 Hz refresh (16.7 ms) */
 #define FBIO_WAITFORVSYNC_ 0x40044620u	/* _IOW('F', 0x20, u32) = MXCFB_WAIT_FOR_VSYNC on i.MX */
 
-static inline int vs_phase_bin(uint32_t t, uint32_t vs, uint32_t period)
-{
-	uint32_t d = t - vs, b;
-	if (period < 5000 || period > 50000 || d > 3 * period) return -1;
-	b = (d % period) * VS_BINS / period;
-	return b < VS_BINS ? (int)b : VS_BINS - 1;
-}
-
-/* Running estimate of the refresh period from consecutive vsync timestamps; deltas outside 10..25 ms (missed or
- * late wake-ups) are ignored. Returns the new estimate (us). */
-static inline uint32_t vs_period_update(uint32_t est, uint32_t delta)
-{
-	if (delta < 10000 || delta > 25000) return est;
-	if (!est) return delta;
-	return (uint32_t)(((uint64_t)est * 15 + delta + 8) / 16);
-}
-
-/* ---- SCREEN SYNC (WAVE 10) ----
+/* ---- SCREEN SYNC ----
  * rbp's DirectFB waits for the refresh interrupt in gui_task, then copies the finished picture into the single-page
  * screen (~2 ms). The copy overtakes the top-to-bottom readout at row ~93: the tear. With SCREEN SYNC on, the mod's
  * own thread does the refresh waits and keeps the refresh phase (vs_pll), and gui_task's wait becomes a sleep until
  * the next "refresh - lead" (sync_next). Started early enough, the copy runs while the readout is in the bottom rows
- * or the blanking, stays ahead of it and leaves no edge. Index 0 = Pioneer's own wait; 1 = at the refresh (should look
- * like Pioneer: the reference for the others). SYNC_MODES and the names are with the settings file. */
+ * or the blanking, stays ahead of it and leaves no edge. The library always starts gui_task's copy 4.5 ms
+ * before the refresh (SYNC_GIG); SYNC_MODES and the names are with the settings file. */
 static const int32_t sync_lead_us[SYNC_MODES] = { 0, 0, 1500, 3000, 4500, 6000 };
 #define SYNC_PERIOD_NOMINAL_Q8 (16800u * 256u)	/* the panel's refresh (measured: 16.80 ms), us * 256 */
 
@@ -781,7 +578,7 @@ struct vs_pll {
 	int32_t win_res;
 	uint32_t n, win, windows, valid;
 	uint32_t learn[VS_WIN];		/* the first wakes after a start, us after learn_t0 */
-	uint32_t wakes, resets, res_sum, res_max, late;	/* for the log: residuals against the model, us */
+	uint32_t wakes, resets, res_sum, res_max, late;	/* residuals against the model, us */
 };
 
 static inline int32_t vs_pll_res(const struct vs_pll *p, uint64_t t)
@@ -866,435 +663,7 @@ static inline void vs_pll_add(struct vs_pll *p, uint64_t t)
 	p->win = 0;
 }
 
-/* Frame meter: gap = time between the ends of two frames (us). Single writer (gui_task); the logger reads it once
- * a minute and takes differences, so a torn read only blurs one line. */
-struct gui_meter {
-	uint32_t frames, late, very_late, safety, dt_sum, dt_max, gap_max_us;
-	uint32_t phase[VS_BINS], no_phase;	/* frame ends per 1 ms of the refresh cycle (0.11) */
-};
-
-static inline void gui_meter_add(struct gui_meter *m, uint32_t dt, uint32_t gap_us, uint32_t period, int safety)
-{
-	m->frames++;
-	m->dt_sum += dt;
-	if (dt > m->dt_max) m->dt_max = dt;
-	if (gap_us > m->gap_max_us) m->gap_max_us = gap_us;
-	if (gap_us > period * 1500u) m->late++;		/* > 1.5 periods: at least one frame missed */
-	if (gap_us > period * 2500u) m->very_late++;	/* > 2.5 periods */
-	m->safety += safety != 0;
-}
-
-/* gui_task's CPU time per frame (WAVE 8), from its thread CPU clock (exact, unlike the 10 ms ticks in /proc).
- * "Off" = draw time - CPU time: the part of drawing a frame in which gui_task didn't run (preempted or waiting).
- * Single writer (gui_task), read once a minute like gui_meter. */
-#define GUI_OFF_BINS 5
-static const uint32_t gui_off_lim[GUI_OFF_BINS - 1] = { 5000, 10000, 15000, 20000 };
-struct gui_cpu {
-	uint32_t frames, cpu_sum, cpu_max, off_sum, off_max, late, late_cpu_sum, late_off_sum, hist[GUI_OFF_BINS];
-};
-
-static inline void gui_cpu_add(struct gui_cpu *m, uint32_t dt_ms, uint32_t cpu_us, int late)
-{
-	uint32_t draw = dt_ms * 1000u, off = draw > cpu_us ? draw - cpu_us : 0;
-	unsigned b = 0;
-	while (b < GUI_OFF_BINS - 1 && off >= gui_off_lim[b]) b++;
-	m->frames++;
-	m->cpu_sum += cpu_us;
-	if (cpu_us > m->cpu_max) m->cpu_max = cpu_us;
-	m->off_sum += off;
-	if (off > m->off_max) m->off_max = off;
-	m->hist[b]++;
-	if (late) {
-		m->late++;
-		m->late_cpu_sum += cpu_us;
-		m->late_off_sum += off;
-	}
-}
-
-/* ---- Frame timeline (WAVE 9) ----
- * gui_task's way to the screen in one frame, from hooks on rbp's framebuffer ioctls and on DirectFB 1.4's flip path
- * (exported functions that libdirectfb and its window manager call through the PLT): when the frame starts drawing,
- * when it waits for the refresh (FBIO_WAITFORVSYNC), when the window manager composes the window into the layer
- * (blits and fills inside dfb_window_repaint / dfb_layer_region_flip_update) and when the picture is copied to the
- * screen (dfb_back_to_front_copy), with the rows written. Times are us after the end of the previous frame
- * (gui_frame). Single writer (gui_task). */
-#define FT_NONE 0xffffffffu
-enum { FT_DRAW, FT_POS, FT_REP, FT_FLIP, FT_WAIT, FT_COPY, FT_BLIT, FT_SFLIP, FT_IOCTL, FT_TYPES };
-static const char *const ft_name[FT_TYPES] = { "draw", "pos", "repaint", "flip", "wait", "copy", "blit", "sflip",
-					       "ioctl" };
-#define FTC_REP 1	/* inside dfb_window_repaint */
-#define FTC_FLIP 2	/* inside dfb_layer_region_flip_update */
-#define FTC_COPY 4	/* inside dfb_back_to_front_copy(_rotation) */
-#define FT_EVS 24
-#define FB_PAN_ 0x4606u		/* FBIOPAN_DISPLAY */
-#define FB_GET_VAR_ 0x4600u	/* FBIOGET_VSCREENINFO */
-#define FB_PUT_VAR_ 0x4601u	/* FBIOPUT_VSCREENINFO */
-#define FB_GET_FIX_ 0x4602u	/* FBIOGET_FSCREENINFO */
-struct ft_ev {
-	uint32_t t, dur;
-	uint8_t type, ctx;
-	uint16_t arg;			/* flip flags, ioctl request (low 16 bits), blits merged into this entry */
-	int16_t x1, y1, x2, y2;		/* area written; x1 > x2 = unknown (a pan keeps its yoffset in y1) */
-};
-struct ft_span { uint32_t in, out, n; };	/* earliest start, latest end, calls */
-struct ft_frame {
-	int valid;
-	uint32_t base;			/* low 32 bits of the absolute time (us) the times count from */
-	uint32_t draw, pos, n_draw;	/* first drawing call outside the flip path, first pos_hook, drawing calls */
-	uint32_t wait_in, wait_out;	/* the longest wait for the refresh */
-	uint32_t n_wait, wait_flip;	/* waits, and those inside dfb_layer_region_flip_update */
-	struct ft_span rep, flip, copy, blit;	/* blit: blits/fills on the flip path outside the copy */
-	int16_t by1, by2, cy1, cy2;	/* rows written by those blits / by the copy */
-	uint32_t flags, n_sflip, n_pan, n_ioctl, end;
-	uint32_t nev, lost;
-	struct ft_ev ev[FT_EVS];
-};
-
-static inline void ft_begin(struct ft_frame *f, uint32_t base)
-{
-	memset(f, 0, sizeof *f);
-	f->valid = 1;
-	f->base = base;
-	f->draw = f->pos = f->wait_in = f->wait_out = f->end = FT_NONE;
-	f->rep.in = f->flip.in = f->copy.in = f->blit.in = FT_NONE;
-	f->by1 = f->cy1 = INT16_MAX;
-	f->by2 = f->cy2 = INT16_MIN;
-}
-
-static inline int16_t ft_i16(int32_t v) { return v < INT16_MIN ? INT16_MIN : v > INT16_MAX ? INT16_MAX : (int16_t)v; }
-
-static inline void ft_span_add(struct ft_span *s, uint32_t t, uint32_t dur)
-{
-	if (s->in == FT_NONE || t < s->in) s->in = t;
-	if (!s->n || t + dur > s->out) s->out = t + dur;
-	s->n++;
-}
-
-/* rows y1..y2 into the running union lo..hi (lo > hi = nothing yet) */
-static inline void ft_rows(int16_t *lo, int16_t *hi, int32_t y1, int32_t y2)
-{
-	if (y1 > y2) return;
-	if (ft_i16(y1) < *lo) *lo = ft_i16(y1);
-	if (ft_i16(y2) > *hi) *hi = ft_i16(y2);
-}
-
-/* One call on gui_task's path, noted when it returns: t = its start (us after base), dur = its length, ctx = the
- * flip-path calls it ran inside (FTC_*), arg and area as in ft_ev. Drawing calls (FT_DRAW) aren't timed one by one:
- * only the first one's start counts. A run of blits in the same place becomes one entry. */
-static inline void ft_note(struct ft_frame *f, int type, int ctx, uint32_t t, uint32_t dur, uint32_t arg, int32_t x1,
-			   int32_t y1, int32_t x2, int32_t y2)
-{
-	struct ft_ev *e;
-	switch (type) {
-	case FT_DRAW:
-		if (f->draw == FT_NONE) f->draw = t;
-		f->n_draw++;
-		return;
-	case FT_POS:
-		if (f->pos != FT_NONE) return;
-		f->pos = t;
-		break;
-	case FT_WAIT:
-		f->n_wait++;
-		if (ctx & FTC_FLIP) f->wait_flip++;
-		if (f->wait_in == FT_NONE || dur > f->wait_out - f->wait_in) {
-			f->wait_in = t;
-			f->wait_out = t + dur;
-		}
-		break;
-	case FT_REP:
-		ft_span_add(&f->rep, t, dur);
-		break;
-	case FT_FLIP:
-		ft_span_add(&f->flip, t, dur);
-		f->flags |= arg;
-		break;
-	case FT_COPY:
-		ft_span_add(&f->copy, t, dur);
-		ft_rows(&f->cy1, &f->cy2, y1, y2);
-		break;
-	case FT_BLIT:
-		if (ctx & FTC_COPY) {
-			ft_rows(&f->cy1, &f->cy2, y1, y2);
-		} else {
-			ft_span_add(&f->blit, t, dur);
-			ft_rows(&f->by1, &f->by2, y1, y2);
-		}
-		break;
-	case FT_SFLIP:
-		f->n_sflip++;
-		break;
-	case FT_IOCTL:
-		if (arg == FB_PAN_) f->n_pan++;
-		else f->n_ioctl++;
-		break;
-	default:
-		return;
-	}
-	e = f->nev ? &f->ev[f->nev - 1] : NULL;
-	if (type == FT_BLIT && e && e->type == FT_BLIT && e->ctx == ctx) {
-		uint32_t end = t + dur > e->t + e->dur ? t + dur : e->t + e->dur;
-		if (t < e->t) e->t = t;
-		e->dur = end - e->t;
-		if (e->arg < 0xffff) e->arg++;
-		if (x1 <= x2 && y1 <= y2) {
-			if (e->x1 > e->x2) {
-				e->x1 = ft_i16(x1), e->y1 = ft_i16(y1), e->x2 = ft_i16(x2), e->y2 = ft_i16(y2);
-			} else {
-				if (ft_i16(x1) < e->x1) e->x1 = ft_i16(x1);
-				if (ft_i16(y1) < e->y1) e->y1 = ft_i16(y1);
-				if (ft_i16(x2) > e->x2) e->x2 = ft_i16(x2);
-				if (ft_i16(y2) > e->y2) e->y2 = ft_i16(y2);
-			}
-		}
-		return;
-	}
-	if (f->nev >= FT_EVS) {
-		f->lost++;
-		return;
-	}
-	e = &f->ev[f->nev++];
-	e->t = t;
-	e->dur = dur;
-	e->type = (uint8_t)type;
-	e->ctx = (uint8_t)ctx;
-	e->arg = (uint16_t)(type == FT_BLIT ? 1 : arg);
-	e->x1 = ft_i16(x1), e->y1 = ft_i16(y1), e->x2 = ft_i16(x2), e->y2 = ft_i16(y2);
-}
-
-/* Minute figures: two classes of frames (0 on time, 1 late), the writes to the screen relative to the end of the
- * wait for the refresh, in 1 ms bins: below -2 ms, -2..14 ms, 14 ms and more. */
-#define FT_HB 18
-static inline unsigned ft_hbin(uint32_t t, uint32_t ref)
-{
-	int32_t d = (int32_t)(t - ref);
-	if (d < -2000) return 0;
-	d = (d + 2000) / 1000 + 1;
-	return d > FT_HB - 1 ? FT_HB - 1 : (unsigned)d;
-}
-struct ft_wr {		/* one kind of write: 0 the copy to the screen, 1 blits/fills on the flip path */
-	uint32_t n, dur_sum, dur_max;
-	int32_t start_sum;
-	uint32_t h_start[FT_HB], h_end[FT_HB];
-	int16_t y1, y2;
-};
-struct ft_cls {
-	uint32_t frames, no_wait, multi_wait, wait_flip, no_draw, draw_calls, flags, sflips, pans;
-	uint32_t n_b, s_b, s_w, s_a, n_t, s_t, n_pos;	/* b = start..wait, w = wait, a = wait..end, t = start..end */
-	int32_t s_pos;					/* first pos_hook relative to the end of the wait */
-	struct ft_wr wr[2];
-};
-#define OC_MAX 12
-struct ft_min {
-	uint32_t seq;			/* first: seqlock (gui_task writes, the logger copies) */
-	struct ft_cls c[2];
-	uint32_t per_sum, per_n;	/* refresh period: time between wait ends / refreshes in it */
-	uint32_t oc_frames[2], oc_sum[2][OC_MAX], oc_max[OC_MAX];	/* other core-0 threads' CPU per frame, us */
-};
-#define FT_REF_PERIOD 16683u	/* 60 Hz, only to count the refreshes between two wait ends */
-
-static inline void ft_wr_add(struct ft_wr *w, const struct ft_span *s, int16_t y1, int16_t y2, uint32_t ref)
-{
-	uint32_t dur;
-	if (!s->n) return;
-	if (!w->n) {
-		w->y1 = INT16_MAX;
-		w->y2 = INT16_MIN;
-	}
-	w->n++;
-	dur = s->out - s->in;
-	w->dur_sum += dur;
-	if (dur > w->dur_max) w->dur_max = dur;
-	w->start_sum += (int32_t)(s->in - ref);
-	w->h_start[ft_hbin(s->in, ref)]++;
-	w->h_end[ft_hbin(s->out, ref)]++;
-	ft_rows(&w->y1, &w->y2, y1, y2);
-}
-
-/* A finished frame into the minute figures. *prev_wo: the previous frame's wait end (absolute, low 32 bits; 0 =
- * none), kept by the caller across minutes. */
-static inline void ft_add(struct ft_min *m, const struct ft_frame *f, int late, uint32_t *prev_wo)
-{
-	struct ft_cls *c = &m->c[late != 0];
-	uint32_t wo;
-	c->frames++;
-	c->draw_calls += f->n_draw;
-	c->flags |= f->flags;
-	c->sflips += f->n_sflip;
-	c->pans += f->n_pan;
-	if (f->draw == FT_NONE) {
-		c->no_draw++;
-	} else if (f->end != FT_NONE && f->end >= f->draw) {
-		c->n_t++;
-		c->s_t += f->end - f->draw;
-	}
-	if (!f->n_wait) {
-		c->no_wait++;
-		*prev_wo = 0;
-		return;
-	}
-	c->multi_wait += f->n_wait > 1;
-	c->wait_flip += f->wait_flip > 0;
-	if (f->draw != FT_NONE && f->draw <= f->wait_in) {
-		c->n_b++;
-		c->s_b += f->wait_in - f->draw;
-	}
-	c->s_w += f->wait_out - f->wait_in;
-	if (f->end != FT_NONE && f->end >= f->wait_out) c->s_a += f->end - f->wait_out;
-	if (f->pos != FT_NONE) {
-		c->n_pos++;
-		c->s_pos += (int32_t)(f->pos - f->wait_out);
-	}
-	ft_wr_add(&c->wr[0], &f->copy, f->cy1, f->cy2, f->wait_out);
-	ft_wr_add(&c->wr[1], &f->blit, f->by1, f->by2, f->wait_out);
-	wo = f->base + f->wait_out;
-	if (*prev_wo) {
-		uint32_t d = wo - *prev_wo, n = (d + FT_REF_PERIOD / 2) / FT_REF_PERIOD;
-		if (n >= 1 && n <= 6) {
-			m->per_sum += d;
-			m->per_n += n;
-		}
-	}
-	*prev_wo = wo ? wo : 1;
-}
-
-/* Another core-0 thread's CPU time in one frame (us), thread i of the published list. */
-static inline void oc_add(struct ft_min *m, unsigned i, uint32_t d, int late)
-{
-	if (i >= OC_MAX) return;
-	m->oc_sum[late != 0][i] += d;
-	if (d > m->oc_max[i]) m->oc_max[i] = d;
-}
-
-/* One frame as text, in time order (ms after the previous frame's end):
- * "draw 2.1 (85 calls), pos 8.0, wait 20.1+15.8 in flip, ..., end 46.0". Returns the length. */
-#define FT_PUT(...)                                                                                         \
-	do {                                                                                                \
-		if (len < n) {                                                                              \
-			int w_ = snprintf(b + len, n - len, __VA_ARGS__);                                   \
-			if (w_ > 0) len += (size_t)w_;                                                      \
-		}                                                                                           \
-	} while (0)
-static inline size_t ft_format(char *b, size_t n, const struct ft_frame *f)
-{
-	struct ft_ev ev[FT_EVS], tmp;
-	size_t len = 0;
-	unsigned i, j, k = f->nev < FT_EVS ? f->nev : FT_EVS;
-	if (!n) return 0;
-	b[0] = 0;
-	memcpy(ev, f->ev, k * sizeof ev[0]);
-	for (i = 1; i < k; i++)	/* noted at their end, nested calls first: sort by start */
-		for (j = i; j > 0 && ev[j].t < ev[j - 1].t; j--) {
-			tmp = ev[j];
-			ev[j] = ev[j - 1];
-			ev[j - 1] = tmp;
-		}
-	if (f->draw != FT_NONE) FT_PUT("draw %.1f (%u calls)", f->draw / 1000.0, f->n_draw);
-	else FT_PUT("no drawing");
-	for (i = 0; i < k; i++) {
-		const struct ft_ev *e = &ev[i];
-		FT_PUT(", %s %.1f", e->type < FT_TYPES ? ft_name[e->type] : "?", e->t / 1000.0);
-		if (e->type != FT_POS) FT_PUT("+%.1f", e->dur / 1000.0);
-		if (e->type == FT_BLIT && e->arg > 1) FT_PUT(" x%u", e->arg);
-		if (e->type == FT_FLIP) FT_PUT(" flags %x", e->arg);
-		if (e->type == FT_IOCTL) FT_PUT(" %x", e->arg);
-		if (e->type == FT_IOCTL && e->arg == FB_PAN_) FT_PUT(" y %d", e->y1);
-		if (e->x1 <= e->x2 && e->y1 <= e->y2) FT_PUT(" [%d,%d-%d,%d]", e->x1, e->y1, e->x2, e->y2);
-		if (e->ctx) FT_PUT(" in %s", e->ctx & FTC_COPY ? "copy" : e->ctx & FTC_FLIP ? "flip" : "repaint");
-	}
-	if (f->lost) FT_PUT(", %u more", f->lost);
-	if (f->lost || f->n_wait > 1) {	/* from the frame's own figures, in case its events didn't all fit */
-		if (f->n_wait)
-			FT_PUT(", longest of %u waits %.1f+%.1f", f->n_wait, f->wait_in / 1000.0,
-			       (f->wait_out - f->wait_in) / 1000.0);
-		if (f->copy.n) FT_PUT(", copies %.1f-%.1f (%u)", f->copy.in / 1000.0, f->copy.out / 1000.0, f->copy.n);
-		if (f->blit.n)
-			FT_PUT(", flip-path blits %.1f-%.1f (%u)", f->blit.in / 1000.0, f->blit.out / 1000.0, f->blit.n);
-	}
-	if (f->end != FT_NONE) FT_PUT(", end %.1f", f->end / 1000.0);
-	if (len >= n) len = n - 1;
-	return len;
-}
-
-/* rbp's framebuffer requests (any thread): count, by gui_task, time in the call. A slot is claimed on first use. */
-#define FB_REQS 8
-struct fb_req { uint32_t req, n, gui, us_sum, us_max; };
-static inline struct fb_req *fb_req_slot(struct fb_req *tab, uint32_t req)
-{
-	unsigned i;
-	for (i = 0; i < FB_REQS; i++) {
-		uint32_t seen = __atomic_load_n(&tab[i].req, __ATOMIC_RELAXED);
-		if (seen == req) return &tab[i];
-		if (!seen) {
-			if (__atomic_compare_exchange_n(&tab[i].req, &seen, req, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-				return &tab[i];
-			if (seen == req) return &tab[i];	/* another thread claimed it for the same request */
-		}
-	}
-	return NULL;
-}
-static inline void fb_req_add(struct fb_req *s, uint32_t us, int gui)
-{
-	uint32_t m = __atomic_load_n(&s->us_max, __ATOMIC_RELAXED);
-	__atomic_fetch_add(&s->n, 1, __ATOMIC_RELAXED);
-	if (gui) __atomic_fetch_add(&s->gui, 1, __ATOMIC_RELAXED);
-	__atomic_fetch_add(&s->us_sum, us, __ATOMIC_RELAXED);
-	while (us > m && !__atomic_compare_exchange_n(&s->us_max, &m, us, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-	}
-}
-
-/* The panel timing from rbp's own FBIOGET/PUT_VSCREENINFO (struct fb_var_screeninfo, 160 bytes: 40 u32) and
- * FBIOGET_FSCREENINFO (struct fb_fix_screeninfo, 68 bytes on 32-bit ARM). One line takes (xres + margins + hsync)
- * pixel clocks, one refresh (yres + margins + vsync) lines. */
-struct fb_timing {
-	uint32_t xres, yres, xvirt, yvirt, yoffset, bpp, pixclock, left, right, upper, lower, hsync, vsync;
-	uint32_t line_ns, frame_us;	/* 0 = no pixel clock */
-};
-static inline int fb_var_parse(const void *var, struct fb_timing *t)
-{
-	uint32_t v[40];
-	memcpy(v, var, sizeof v);
-	t->xres = v[0], t->yres = v[1], t->xvirt = v[2], t->yvirt = v[3], t->yoffset = v[5], t->bpp = v[6];
-	t->pixclock = v[25], t->left = v[26], t->right = v[27], t->upper = v[28], t->lower = v[29];
-	t->hsync = v[30], t->vsync = v[31];
-	t->line_ns = t->frame_us = 0;
-	if (!t->pixclock || !t->xres || !t->yres || t->xres > 8192 || t->yres > 8192) return 0;
-	t->line_ns = (uint32_t)(((uint64_t)(t->xres + t->left + t->right + t->hsync) * t->pixclock + 500) / 1000);
-	t->frame_us = (uint32_t)(((uint64_t)t->line_ns * (t->yres + t->upper + t->lower + t->vsync) + 500) / 1000);
-	return 1;
-}
-struct fb_fix { char id[17]; uint32_t smem_len, line_length; uint16_t ypanstep; };
-static inline void fb_fix_parse(const void *fix, struct fb_fix *x)
-{
-	const uint8_t *p = (const uint8_t *)fix;
-	memcpy(x->id, p, 16);
-	x->id[16] = 0;
-	memcpy(&x->smem_len, p + 20, 4);
-	memcpy(&x->ypanstep, p + 38, 2);
-	memcpy(&x->line_length, p + 44, 4);
-}
-
-/* Splits a long text into lines of at most max chars, at the last ", " or "; " that fits (a short line rather than
- * a cut word); a hard cut only if there is none. Returns the length of the first line; *next = where the rest starts
- * (after the separator), or NULL at the end. */
-static inline size_t text_chunk(const char *s, size_t max, const char **next)
-{
-	size_t n = strlen(s), cut, i;
-	if (n <= max) {
-		*next = NULL;
-		return n;
-	}
-	cut = max;
-	for (i = max; i > 0; i--)
-		if ((s[i] == ',' || s[i] == ';') && s[i + 1] == ' ') {
-			cut = i + 1;
-			break;
-		}
-	*next = s + cut + (s[cut] == ' ');
-	return cut;
-}
-
-/* ---- Waveform position at draw time (WAVE 7) ----
+/* ---- Waveform position at draw time ----
  * Ui_CycleTask (0x17814c) wakes every >= 16 ms (dly_tsk) and copies rbp's deck state into a snapshot (0xe49ac: memcpy
  * of 388 bytes to POS_DECKS, under rbp's lock). gui_task draws each big waveform from that snapshot: 0x1cb58c(deck)
  * turns the position (ms, +0x5c) into the playhead column (wv +0xc) that the column loop starts from. The snapshot
@@ -1520,43 +889,6 @@ static inline uint32_t pos_delay_step(struct pos_delay *p)
 	return p->d;
 }
 
-/* Minute figures, written by gui_task between two seq increments (odd while writing); the logger copies them when
- * seq is even and unchanged. Step errors: a frame's move minus speed x the time since the deck's last frame, for
- * the snapshot (what Pioneer shows) and for the position at the delay (SMOOTH), in us of track. */
-#define POS_HIST 6	/* copy intervals: <= 17, 20, 25, 33, 50 ms, more */
-static const uint32_t pos_hist_lim[POS_HIST - 1] = { 17000, 20000, 25000, 33000, 50000 };
-struct pos_stats {
-	uint32_t seq;
-	uint32_t copies, lost, iv_min, iv_max, hist[POS_HIST];
-	uint64_t iv_sum;
-	uint32_t kinds[POS_FIRST + 1];
-	uint32_t res_n, res_max;
-	uint64_t res_sq;
-	uint32_t frames, steps, err_p_max, err_o_max, starved, mismatch, raced, delay_max;
-	uint64_t err_p_sq, err_o_sq, delay_sum;
-};
-
-static inline void pos_stats_copy(struct pos_stats *s, uint32_t iv_us)
-{
-	unsigned h = 0;
-	s->copies++;
-	s->iv_sum += iv_us;
-	if (!s->iv_min || iv_us < s->iv_min) s->iv_min = iv_us;
-	if (iv_us > s->iv_max) s->iv_max = iv_us;
-	while (h < POS_HIST - 1 && iv_us > pos_hist_lim[h]) h++;
-	s->hist[h]++;
-}
-
-static inline void pos_stats_step(struct pos_stats *s, double err_p_ms, double err_o_ms)
-{
-	uint32_t p = (uint32_t)(fabs(err_p_ms) * 1000 + 0.5), o = (uint32_t)(fabs(err_o_ms) * 1000 + 0.5);
-	s->steps++;
-	s->err_p_sq += (uint64_t)p * p;
-	s->err_o_sq += (uint64_t)o * o;
-	if (p > s->err_p_max) s->err_p_max = p;
-	if (o > s->err_o_max) s->err_o_max = o;
-}
-
 /* ---- Utility menu ----
  * {u32 count; item[count]} at 0x4621a4 in rbp's .data, items of 52 bytes. The code reaches it only through
  * literal words: UT_TABLE at six places, UT_TABLE + 4 at one. */
@@ -1690,176 +1022,6 @@ static inline int pcm_role(const char *name, int stream)
 	if (name[n - 2] == ',' && name[n - 1] == '0') return 1;
 	if (name[n - 2] == ',' && name[n - 1] == '2') return 2;
 	return 0;
-}
-
-/* ---- Health log (long tests) ---- */
-struct cpu_ticks { uint64_t busy, total; };
-
-/* /proc/stat: fills c[i] for the lines "cpu<i> user nice system idle iowait irq softirq"; returns how many. */
-static inline int parse_proc_stat(const char *txt, struct cpu_ticks *c, int max)
-{
-	const char *p = txt;
-	int n = 0;
-	while (p && *p) {
-		unsigned long long v[7] = { 0 };
-		int i;
-		if (!strncmp(p, "cpu", 3) && p[3] >= '0' && p[3] <= '9' &&
-		    sscanf(p, "cpu%d %llu %llu %llu %llu %llu %llu %llu", &i, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5],
-			   &v[6]) >= 5 && i >= 0 && i < max) {
-			c[i].busy = v[0] + v[1] + v[2] + v[5] + v[6];
-			c[i].total = c[i].busy + v[3] + v[4];
-			if (i + 1 > n) n = i + 1;
-		}
-		p = strchr(p, '\n');
-		if (p) p++;
-	}
-	return n;
-}
-
-static inline unsigned pct_of(uint64_t part, uint64_t whole)
-{
-	return whole ? (unsigned)((part * 100 + whole / 2) / whole) : 0;
-}
-
-/* "Key:   1234 kB" lines (/proc/meminfo, /proc/self/status): the number, or -1. */
-static inline long kv_number(const char *txt, const char *key)
-{
-	const char *p = strstr(txt, key);
-	size_t n = strlen(key);
-	while (p && p != txt && p[-1] != '\n') p = strstr(p + 1, key);
-	if (!p || p[n] != ':') return -1;
-	return strtol(p + n + 1, NULL, 10);
-}
-
-/* /proc/self/stat: utime + stime (fields 14, 15), in clock ticks; 0 if unparsable. */
-static inline uint64_t proc_stat_cpu(const char *txt)
-{
-	const char *p = strrchr(txt, ')');	/* the command name may contain spaces */
-	unsigned long long ut = 0, st = 0;
-	if (!p || sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &st) != 2) return 0;
-	return ut + st;
-}
-
-/* A thread's /proc/<pid>/task/<tid>/stat (WAVE 8 thread survey): name, state, CPU ticks, nice, the CPU it last ran
- * on, real-time priority and policy (0 normal, 1 FIFO, 2 RR). Returns 1 if all fields up to the policy (41) were
- * there. */
-struct task_stat {
-	char comm[16];
-	char state;
-	uint64_t cpu;
-	int nice, processor, rt_prio, policy;
-};
-
-static inline int parse_task_stat(const char *txt, struct task_stat *o)
-{
-	const char *a = strchr(txt, '('), *z = strrchr(txt, ')'), *p;
-	unsigned long long ut = 0, st = 0;
-	size_t n;
-	int field;
-	if (!a || !z || z < a || !z[1] || !z[2]) return 0;
-	n = (size_t)(z - a - 1);
-	if (n > sizeof o->comm - 1) n = sizeof o->comm - 1;
-	memcpy(o->comm, a + 1, n);
-	o->comm[n] = 0;
-	o->state = z[2];
-	o->nice = 0;
-	o->processor = o->rt_prio = o->policy = -1;
-	for (p = z + 2, field = 3; field <= 41; field++) {
-		if (field == 14) ut = strtoull(p, NULL, 10);
-		else if (field == 15) st = strtoull(p, NULL, 10);
-		else if (field == 19) o->nice = (int)strtol(p, NULL, 10);
-		else if (field == 39) o->processor = (int)strtol(p, NULL, 10);
-		else if (field == 40) o->rt_prio = (int)strtol(p, NULL, 10);
-		else if (field == 41) o->policy = (int)strtol(p, NULL, 10);
-		if (field == 41) break;
-		p = strchr(p, ' ');
-		if (!p) return 0;
-		p++;
-	}
-	o->cpu = ut + st;
-	return 1;
-}
-
-/* The text value of "key:" in a /proc status file, without the whitespace around it; "" if missing. */
-static inline void kv_text(const char *txt, const char *key, char *out, size_t n)
-{
-	size_t k = strlen(key), i = 0;
-	const char *p = txt;
-	out[0] = 0;
-	while ((p = strstr(p, key)) && !((p == txt || p[-1] == '\n') && p[k] == ':')) p += k;
-	if (!p) return;
-	p += k + 1;
-	while (*p == ' ' || *p == '\t') p++;
-	while (p[i] && p[i] != '\n' && i < n - 1) {
-		out[i] = p[i];
-		i++;
-	}
-	out[i] = 0;
-}
-
-/* /proc/<pid>/task/<tid>/schedstat: time on the CPU, time waiting on the run queue (runnable but not running),
- * both ns, and the number of times it got the CPU. Returns 1 if all three were there. */
-static inline int parse_schedstat(const char *txt, uint64_t *run_ns, uint64_t *wait_ns, uint64_t *slices)
-{
-	unsigned long long r, w, s;
-	if (sscanf(txt, "%llu %llu %llu", &r, &w, &s) != 3) return 0;
-	*run_ns = r;
-	*wait_ns = w;
-	*slices = s;
-	return 1;
-}
-
-/* One line of /proc/interrupts: the label before ':' ("39", "IPI0", "LOC"), the counts of up to ncpu CPUs (summed),
- * and the rest as the name, spaces squeezed. Returns the number of counts read (0: header or unparsable). */
-static inline int parse_irq_line(const char *line, char *label, size_t ln, uint64_t *sum, int ncpu, char *name,
-				 size_t nn)
-{
-	const char *c = strchr(line, ':'), *p = line, *e = strchr(line, '\n');
-	size_t i = 0;
-	int k = 0;
-	if (!e) e = line + strlen(line);
-	if (!c || c > e) return 0;
-	while (*p == ' ') p++;
-	while (p < c && i < ln - 1) label[i++] = *p++;
-	label[i] = 0;
-	*sum = 0;
-	for (p = c + 1; k < ncpu; k++) {
-		char *q;
-		unsigned long long v;
-		while (*p == ' ' && p < e) p++;
-		if (p >= e || *p < '0' || *p > '9') break;
-		v = strtoull(p, &q, 10);
-		*sum += v;
-		p = q;
-	}
-	i = 0;
-	while (p < e && i < nn - 1) {
-		if (*p == ' ' && (i == 0 || name[i - 1] == ' ')) {
-			p++;
-			continue;
-		}
-		name[i++] = *p++;
-	}
-	while (i && name[i - 1] == ' ') i--;
-	name[i] = 0;
-	return k;
-}
-
-/* Display activity: hash of a sparse sample of each horizontal band of the framebuffer (RGB565). A band whose
- * hash changes between polls was redrawn; changes per second ≈ that band's frame rate. */
-#define FB_BANDS 15
-static inline void fb_band_hashes(const volatile uint16_t *fb, unsigned stride_px, unsigned w, unsigned h,
-				  uint32_t *hash)
-{
-	unsigned b, x, k, bh = h / FB_BANDS;
-	for (b = 0; b < FB_BANDS; b++) {
-		uint32_t v = 2166136261u;
-		for (k = 1; k <= 3; k += 2) {	/* rows at 1/4 and 3/4 of the band */
-			const volatile uint16_t *row = fb + (size_t)(b * bh + k * bh / 4) * stride_px;
-			for (x = 3; x < w; x += 16) v = (v ^ row[x]) * 16777619u;
-		}
-		hash[b] = v;
-	}
 }
 
 /* The headphone mixer object in rbp 2.21 (mixerengine::HeadPhone):
@@ -2046,7 +1208,7 @@ static inline void wave_draw_col(uint16_t *canvas, uint32_t deck, uint32_t col, 
 		*px = y < h ? c : !(f & 6) ? 0 : (f & 4) ? 0x3186 : 0xb300;
 }
 
-/* ---- 3-band detail waveform (wave-4) ----
+/* ---- 3-band detail waveform ----
  * PWV7 in the .2EX beside the .EXT: 3 bytes per entry, low, mid, high (measured against the audio), as many as
  * PWV3. Drawn the way the CDJ-2000NXS2 three_band mod draws it: each byte clamped to 0..128 and made a step of 1..31
  * (low and mid linear, high on a raised cosine), 1.5 rows per step (1..45 rows up from the centre; rbp mirrors them
@@ -2064,8 +1226,8 @@ static const uint8_t band_hi31[129] = {	/* ceil(31 * (0.5 - 0.5 * cos(pi * v / 1
 	30, 30, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31,
 	31,
 };
-/* Row colour by the bands that reach it (low 4 | mid 2 | high 1), overlaps blended as the NXS2 mod does. WAVE 6 drew
- * opaque layers instead (0xffff, 0xffff, 0xfd20, 0xffff); a second rekordbox screenshot matches the blend. */
+/* Row colour by the bands that reach it (low 4 | mid 2 | high 1), overlaps blended as the NXS2 mod does (rekordbox
+ * shows the same blend). */
 static const uint16_t band_rgb[8] = { 0x0000, 0xffff, 0xfd20, 0xff9a, 0x02bc, 0xd6ff, 0xb341, 0xf75a };
 /* The cue/loop shading in 3-band: dark red-brown, as Pioneer's 0xb300 is the low + mid blend's colour. */
 #define BAND_LOOP 0x50c0
@@ -2112,7 +1274,7 @@ static inline void wave_draw_col3(uint16_t *canvas, uint32_t deck, uint32_t col,
 	}
 }
 
-/* ---- Colour overview (wave-3) ----
+/* ---- Colour overview ----
  * The overview strip is a 300 x 34 RGB565 surface per deck, drawn by 0x1f8518 (no arguments). Its only caller is the
  * bl at 0x1fb3e8 in the view handler 0x1f98d8 (gui_task), on every pass while the deck has an overview (flag at
  * 0x10829d8 + 4 * deck, cleared when the track goes):
@@ -2267,11 +1429,6 @@ static inline void ov_strip(uint16_t *px, uint32_t pitch, const uint8_t *ov, con
 	}
 }
 
-static inline void ov_draw_strip(uint16_t *px, uint32_t pitch, const uint8_t *ov, const uint16_t *rgb)
-{
-	ov_strip(px, pitch, ov, rgb, NULL);
-}
-
 /* A track's colours, made by the worker from its .EXT file (PWV3 kept to recognise it in a deck's buffer). Only
  * the worker changes or frees one, and only while it is on no deck and no column or overview call can still hold it. */
 struct wave_track {
@@ -2345,16 +1502,16 @@ static inline struct wave_track *wave_track_new(const uint8_t *ext, size_t len, 
 }
 
 struct wave_env {
-	uintptr_t base;			/* 0 in rbp; the tests put rbp's addresses into a buffer */
+	uintptr_t base;			/* 0 in rbp; an off-device test can point the addresses into a buffer */
 	uint32_t ctx;			/* WAVE_CTX */
 	wave_col_fn *orig;		/* Pioneer's routine (WAVE_ORIG) */
 	struct wave_track *pub[2];	/* set by the worker: the track on each deck, NULL = Pioneer's colours */
 	uint32_t inflight;		/* column calls that may hold a track: the worker frees one only at 0 */
-	uint32_t ours, stock;		/* columns drawn, read by the log */
+	uint32_t ours, stock;		/* columns drawn (counted; this build doesn't report them) */
 	ov_orig_fn *ov_orig;		/* Pioneer's overview routine (OV_ORIG) */
 	ov_lock_fn *ov_lock;		/* OV_LOCK */
 	ov_unlock_fn *ov_unlock;	/* OV_UNLOCK */
-	uint32_t ov_ours, ov_stock;	/* overviews drawn, read by the log */
+	uint32_t ov_ours, ov_stock;	/* overviews drawn (counted, not reported) */
 };
 
 /* The column function in RGB (bands 0) or 3-band mode. Draws with the deck's track only if every address is the
@@ -2459,7 +1616,7 @@ struct wave_cache {
 	uint32_t stamp, gen;		/* LRU clock; tracks added so far */
 	uint32_t seen[2], tried[2];	/* per deck: the fingerprint and gen of the last match attempt */
 	int dirty;			/* a track was taken off a deck and no quiet moment has been seen since */
-	uint32_t matched, dropped;	/* counters for the log */
+	uint32_t matched, dropped;	/* counted, not reported */
 };
 
 /* What deck d's buffer holds (read from rbp's memory), or 0 if it holds nothing usable. */
@@ -2564,173 +1721,7 @@ static inline int wave_step(struct wave_env *e, struct wave_cache *c, int (*quie
 	return changed;
 }
 
-
-/* ---------- panel LED set and LED walk (MAP build) ----------
- * LED set: every bit of bytes 0..19 of rbp's LED frames ever seen set (or_) and always seen set (and_). Kept over
- * starts in a small file; the factory test mode's "all LEDs on" (Mode 3) and "all off" (Mode 2) make it complete.
- * LED walk: the library sends its own frames instead of rbp's: three flashes of everything (a marker for the video),
- * the base alone, then each walk bit alone on top of the base. Base = and_ (bits Pioneer always sets), walk bits =
- * or_ & ~and_ (bits Pioneer sets in some frame), so the walk never sets a bit Pioneer itself never set. A bit whose
- * LED lights while it is 0 shows as that LED going off for its step. */
-#define LED_BYTES		20
-#define LED_WALK_MAX		(LED_BYTES * 8)
-#define LED_WALK_FLASHES	3
-#define LED_WALK_FLASH_US	500000u		/* on 0.5 s, base 0.5 s, three times */
-#define LED_WALK_BASE_US	2000000u	/* then the base alone */
-#define LED_WALK_STEP_US	1500000u	/* per bit: on 1.2 s, base 0.3 s (160 bits: 240 s at most) */
-#define LED_WALK_ON_US		1200000u
-
-struct led_set {
-	uint8_t or_[LED_BYTES], and_[LED_BYTES];
-	uint32_t frames;			/* frames seen (and_ means nothing while 0) */
-};
-
-/* Seed: 173,190 recorded LED frames (bytes 8/9, 12/13, 14/15 are the three level meters). */
-static const struct led_set led_seed = {
-	{ 0x7f, 0x31, 0x1c, 0xfe, 0x7f, 0x71, 0x1c, 0x7e, 0xff, 0x0f, 0x30, 0xb0, 0xff, 0x0f, 0xff, 0x07, 0, 0, 0x08, 0xff },
-	{ 0, 0, 0x0c, 0x08, 0, 0, 0x0c, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x84 },
-	173190,
-};
-
-static inline void led_set_init(struct led_set *s)
-{
-	memset(s->or_, 0, LED_BYTES);
-	memset(s->and_, 0xff, LED_BYTES);
-	s->frames = 0;
-}
-
-/* One frame (at least LED_BYTES bytes); returns 1 if or_ or and_ changed. */
-static inline int led_set_add(struct led_set *s, const uint8_t *f)
-{
-	int i, ch = 0;
-	for (i = 0; i < LED_BYTES; i++) {
-		uint8_t o = (uint8_t)(s->or_[i] | f[i]), a = (uint8_t)(s->and_[i] & f[i]);
-		if (o != s->or_[i] || a != s->and_[i]) ch = 1;
-		s->or_[i] = o;
-		s->and_[i] = a;
-	}
-	s->frames++;
-	return ch;
-}
-
-/* Merge another set (one with frames == 0 is empty); returns 1 if or_ or and_ changed. */
-static inline int led_set_merge(struct led_set *s, const struct led_set *o)
-{
-	int i, ch = 0;
-	if (!o->frames) return 0;
-	for (i = 0; i < LED_BYTES; i++) {
-		uint8_t v = (uint8_t)(s->or_[i] | o->or_[i]), a = (uint8_t)(s->and_[i] & o->and_[i]);
-		if (v != s->or_[i] || a != s->and_[i]) ch = 1;
-		s->or_[i] = v;
-		s->and_[i] = a;
-	}
-	s->frames += o->frames;
-	return ch;
-}
-
-/* "or=<40 hex> and=<40 hex> frames=<n>\n"; returns the length (n must be at least 110). */
-static inline int led_set_format(const struct led_set *s, char *buf, size_t n)
-{
-	static const char hx[] = "0123456789abcdef";
-	char o[2 * LED_BYTES + 1], a[2 * LED_BYTES + 1];
-	int i;
-	for (i = 0; i < LED_BYTES; i++) {
-		o[2 * i] = hx[s->or_[i] >> 4];
-		o[2 * i + 1] = hx[s->or_[i] & 15];
-		a[2 * i] = hx[s->and_[i] >> 4];
-		a[2 * i + 1] = hx[s->and_[i] & 15];
-	}
-	o[2 * LED_BYTES] = a[2 * LED_BYTES] = 0;
-	return snprintf(buf, n, "or=%s and=%s frames=%u\n", o, a, (unsigned)s->frames);
-}
-
-static inline int led_hex_byte(const char *p, uint8_t *v)
-{
-	int k, r = 0;
-	for (k = 0; k < 2; k++) {
-		char c = p[k];
-		int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-		if (d < 0) return -1;
-		r = r * 16 + d;
-	}
-	*v = (uint8_t)r;
-	return 0;
-}
-
-/* Parse led_set_format's line; returns 0 if it is complete and sane (and_ within or_, frames > 0), else -1. */
-static inline int led_set_parse(struct led_set *s, const char *txt)
-{
-	struct led_set t;
-	const char *o = strstr(txt, "or="), *a = strstr(txt, "and="), *f = strstr(txt, "frames=");
-	char *end;
-	unsigned long fr;
-	int i;
-	if (!o || !a || !f) return -1;
-	o += 3;
-	a += 4;
-	for (i = 0; i < LED_BYTES; i++)
-		if (led_hex_byte(o + 2 * i, &t.or_[i]) || led_hex_byte(a + 2 * i, &t.and_[i]) || (t.and_[i] & ~t.or_[i]))
-			return -1;
-	fr = strtoul(f + 7, &end, 10);
-	if (end == f + 7 || fr == 0 || fr > 0xffffffffUL) return -1;
-	t.frames = (uint32_t)fr;
-	*s = t;
-	return 0;
-}
-
-struct led_walk {
-	uint8_t base[LED_BYTES], all[LED_BYTES];	/* all = base | every walk bit (the marker flashes) */
-	uint8_t byte[LED_WALK_MAX], mask[LED_WALK_MAX];
-	unsigned n;
-};
-
-/* The walk for a set: bits in order byte 0..19, bit 7..0. Returns the number of bits (0: nothing to walk). */
-static inline unsigned led_walk_plan(struct led_walk *w, const struct led_set *s)
-{
-	int i, b;
-	w->n = 0;
-	for (i = 0; i < LED_BYTES; i++) {
-		uint8_t walk = s->frames ? (uint8_t)(s->or_[i] & ~s->and_[i]) : 0;
-		w->base[i] = s->frames ? s->and_[i] : 0;
-		w->all[i] = (uint8_t)(w->base[i] | walk);
-		for (b = 7; b >= 0; b--)
-			if (walk & (1u << b)) {
-				w->byte[w->n] = (uint8_t)i;
-				w->mask[w->n] = (uint8_t)(1u << b);
-				w->n++;
-			}
-	}
-	return w->n;
-}
-
-static inline uint64_t led_walk_total_us(const struct led_walk *w)
-{
-	return 2ull * LED_WALK_FLASHES * LED_WALK_FLASH_US + LED_WALK_BASE_US + (uint64_t)w->n * LED_WALK_STEP_US;
-}
-
-/* Bytes 0..19 to send dt_us after the walk started. *step: -1 marker flash, -2 base, else the bit's index.
- * Returns 1 while the walk runs, 0 once it is over (out is left alone then). */
-static inline int led_walk_frame(const struct led_walk *w, uint64_t dt_us, uint8_t *out, int *step)
-{
-	uint64_t marker = 2ull * LED_WALK_FLASHES * LED_WALK_FLASH_US;
-	if (dt_us >= led_walk_total_us(w)) return 0;
-	memcpy(out, w->base, LED_BYTES);
-	if (dt_us < marker) {
-		*step = -1;
-		if ((dt_us / LED_WALK_FLASH_US) % 2 == 0) memcpy(out, w->all, LED_BYTES);
-		return 1;
-	}
-	dt_us -= marker;
-	if (dt_us < LED_WALK_BASE_US) {
-		*step = -2;
-		return 1;
-	}
-	dt_us -= LED_WALK_BASE_US;
-	*step = (int)(dt_us / LED_WALK_STEP_US);
-	if (dt_us % LED_WALK_STEP_US < LED_WALK_ON_US) out[w->byte[*step]] |= w->mask[*step];
-	return 1;
-}
-
+#define LED_BYTES		20	/* the LED bits of a frame: bytes 0..19 (then the CRC, panel_tx_seal) */
 
 /* ---------- beat jump ----------
  * SHIFT + AUTO BEAT LOOP opens a subpage of the AUTO BEAT LOOP pad mode: pad 1 = back A, pad 2 = forward A, pad 3 =
@@ -2744,7 +1735,7 @@ static inline int led_walk_frame(const struct led_walk *w, uint64_t dt_us, uint8
 static const uint8_t bj_beats[BJ_SIZES] = { 1, 2, 4, 8, 16, 32 };
 static const char *const bj_name[BJ_SIZES] = { "1", "2", "4", "8", "16", "32" };
 #define BJ_A_DEFAULT	0		/* 1 beat */
-#define BJ_B_DEFAULT	2		/* 4 beats (the user's choice, 2026-11-12) */
+#define BJ_B_DEFAULT	2		/* 4 beats */
 #define BJ_MAX_BEATS	16384u		/* 2 h at 136 BPM */
 #define BJ_RATE		44.1		/* rbp's positions are samples at 44.1 kHz (console jump: ms * 44.1) */
 
@@ -2871,8 +1862,7 @@ static inline int bj_showing(const struct bj_deck *d, int mode)
 
 /* The subpage's LEDs. While deck d shows the subpage, the mod owns these bits in rbp's LED frame;
  * otherwise rbp's own frame goes through. A 0 bit is the panel's own dim level, not dark.
- *  - AUTO BEAT LOOP: 0.5 s bright, 0.5 s dim, starting bright (the CUE blink is 3 per second). 1 s / 1 s
- *    was too slow to see at a glance whether the subpage is on.
+ *  - AUTO BEAT LOOP: 0.5 s bright, 0.5 s dim, starting bright (slower is hard to see at a glance).
  *  - pads: dim, the pressed pad bright while held and at least BJ_PAD_LIT_US (a quick tap shows).
  * bj_pad_led, measured on the panel: {byte, mask}; mask 0 would leave that pad to rbp. Byte 2 / byte 6
  * are the deck's pad-mode byte: pads 1-4 0x80 0x40 0x20 0x10, (0x08 ?), HOT CUE 0x04, AUTO BEAT LOOP 0x02, LOOP SPLIT 0x01. */

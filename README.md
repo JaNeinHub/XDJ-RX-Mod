@@ -68,7 +68,9 @@ Don't switch off while it's writing.
   writes nothing.
 - **Safe start.** If a start hangs, or you switch off within the first minute, the next start runs without the mod.
   The one after that is modded again.
-- **Undo (R1).** `restore-R1/XDJRX.UPD` writes Pioneer's original app back, exactly as shipped.
+- **Undo (R1).** `restore-R1/XDJRX.UPD` writes Pioneer's original app back, exactly as shipped. The mod's small
+  settings file stays in the XDJ-RX's settings area; Pioneer's software ignores it, and a later install picks your
+  settings up again.
 - **Last resort (R2).** `emergency-R2/XDJRX.UPD` is Pioneer's complete official firmware 2.21. Its only change is a
   higher version number, because the XDJ-RX refuses to reinstall the same version.
 
@@ -77,7 +79,8 @@ Don't share the built files. They contain Pioneer's firmware. Point people to th
 ## Reporting a bug
 
 Make a folder called `xdjmod-capture` at the top level of your music stick. While that folder exists, the mod
-writes a log (`hook.log`) into it; without it, the mod writes nothing anywhere. Reproduce the problem, then open an
+writes a log (`hook.log`) into it: start-up, settings changes and errors. Without it, the mod writes nothing
+anywhere. Reproduce the problem, then open an
 issue with:
 
 - `hook.log`;
@@ -97,8 +100,9 @@ Never attach firmware files, keys or music.
 
 ## Building from source
 
-- **The page:** `python3 builder/build.py` writes `builder/build/xdjrx-mod-builder.html`. It needs only Python 3.
-  The page built from a release tag is byte for byte the page attached to that release. See
+- **The page:** the repository holds the page's source, not the finished page (that is on the Releases page).
+  `python3 builder/build.py` writes it to `builder/build/xdjrx-mod-builder.html`. It needs only Python 3. The page
+  built from a release tag is byte for byte the page attached to that release. See
   [`builder/README.md`](builder/README.md).
 - **The library:** `device/libxdjmod/build.sh` cross-compiles it with zig 0.16.0 and compares the result with the
   library inside the builder. See [`device/README.md`](device/README.md).

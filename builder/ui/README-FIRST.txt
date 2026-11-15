@@ -46,7 +46,7 @@ INSTALL
 3. Hold DECK 1 USB STOP and DECK 1 RELOOP/EXIT, and switch the XDJ-RX on. Keep holding until the
    update screen appears.
 4. The screen shows "{name}: install", then "Writing ...", then "{name} installed."
-   This takes about a minute.
+   This takes well under a minute: only the app is replaced, not the whole firmware.
 5. Switch off, remove the stick, switch on. The mod's settings are in UTILITY.
 
 If it says "{name} was already installed.", nothing was written: the mod is already on.
@@ -84,7 +84,9 @@ All settings survive switching off.
 GETTING BACK TO PIONEER'S SOFTWARE
 ----------------------------------
 Normal way: R1. Same steps as INSTALL with restore-R1/XDJRX.UPD. The screen ends with "Original Pioneer
-app restored." Only the app area is rewritten, exactly as Pioneer shipped it.
+app restored." Only the app area is rewritten, exactly as Pioneer shipped it. The mod's settings file
+stays in the XDJ-RX's settings area: Pioneer's software ignores it, and if you install the mod again,
+your mod settings are back.
 
 Last resort: R2 (emergency-R2/XDJRX.UPD). This is Pioneer's complete official firmware 2.21, unchanged
 except that it calls itself version {r2}, because the XDJ-RX refuses to install the same version again.
@@ -106,7 +108,8 @@ A log of every run is saved on the stick as xdjmod-update.log.
 REPORTING A BUG
 ---------------
 1. Make a folder called xdjmod-capture at the top level of your music stick. While it's there, the mod
-   writes a log (hook.log) into it; without it, nothing is written anywhere.
+   writes a log (hook.log) into it: start-up, settings changes and errors. Without the folder, nothing
+   is written anywhere.
 2. Reproduce the problem with that stick plugged in, then send hook.log, your firmware version, what
    you did and what happened.
 Never send firmware files, keys or music.
